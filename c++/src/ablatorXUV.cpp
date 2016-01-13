@@ -1,0 +1,3231 @@
+/*
+
+Ablator++
+
+ENERGY-BASED WALL RESPONSE MODEL
+1-D TRANSIENT HEAT CONDUCTION
+1-D FINITE DIFFERENCE WAVE PROPAGATION
+TEMPERATURE-DEPENDENT MATERIAL PROPERTIES
+HEAT GENERATION FROM X-RAY DEPOSITION
+IN A DOUBLE EXPONENTIAL PULSE
+OR IN SQUARE OR GAUSSIAN PULSES
+USES 45 BIN APPROXIMATION TO SPECTRUM
+SUPPLY COLD OPACITIES IN INVERSE METERS
+EXPLICIT SCHEME
+SIMPLE RATIO ZONING
+UNITS: SI, KEV FOR BBT STUFF
+
+Translation to C++ by Michal Vasinek <michal.vasinek@vsb.cz>
+and Martin Stachon <martin.stachon@vsb.cz>
+
+*/
+
+#include <cmath>
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include "fortranio.h"
+
+using namespace std;
+
+//	IMPLICIT DOUBLE PRECISION(A-H,O-Z) // TODO: all variables beggining with letters a-h, o-z are of type double !
+
+#define N 400
+#define NP1 401
+#define NBIN 45
+#define NSAVE 5
+#define PI 3.14159265358979323846
+
+double H[N]; // TOTAL INTERNAL ENERGY IN ZONE
+double HG[N]; // SPECIFIC INTERNAL ENERGY FOR A ZONE
+double T[NP1+1]; //TODO zero indexed in fortran! // TEMPERATURE IN A ZONE
+double TNEW[NP1+1]; //TODO zero indexed in fortran! // NEW TEMPERATURE (TO BE APPLIED NEXT TIME STEP)
+double ZMASS[NP1]; // MASS IN A ZONE (CONSTANT THROUGH PROBLEM)
+double OPAC[NBIN]; // OPACITY IN INVERSE METERS AT A GIVEN PHOTON ENERGY
+double BIN[NBIN]; // CENTRAL ENERGY (IN KEV) OF A PHOTON BIN
+double BINW[NBIN]; // PHOTON BIN WIDTH
+double EFRAC[N][NBIN]; // FRACTION OF INCIDENT BIN ENERGY EIN(J) ABSORBED IN A ZONE
+double EZONE[N]; // FRACTION OF EIN DEPOSITED IN A ZONE
+double ELEAK[NBIN]; // RUNNING SUM OF LEAK ENERGY IN A BIN
+double EIN[NBIN]; // TOTAL ENERGY ADDED THIS STEP IN A BIN
+double ELEAKOLD[NBIN]; // SUM FROM THE LAST TIME STEP
+double FBBLEAK[NBIN]; // FRACTION OF LEAK ENERGY IN A BIN
+double XLOC[NP1]; // CENTER OF ORIGINAL ZONE (MICRONS)
+double ACOND[13]; // COEFFICIENTS FOR THERMAL CONDUCTIVITY VS TEMP
+double AH2T[10]; // COEFFICIENTS FOR TEMPERATURE-ETHALPY RELATIONS
+double EOSCOEF[10]; // COEFFICIENTS FOR EQUATIONS OF STATE
+double SIGMACOEF[7]; // COEFFICIENTS FOR SURFACE TENSION (AKA SIGMA)
+double YIELDCOEF[3];
+double A[N+1]; //TODO zero indexed in fortran! // ACCELERATION OF A NODE
+double U[NP1+1]; //TODO zero indexed in fortran! // VELOCITY OF A NODE
+double X[NP1+1]; //TODO zero indexed in fortran! // LOCATION OF A NODE
+double X0[NP1+1]; //TODO zero indexed in fortran! // ORIGINAL LOCATION OF A NODE
+double XC[NP1]; // CURRENT CENTER LOCATION OF A ZONE
+double XNEW[N+1]; //TODO zero indexed in fortran! // NEW NODE LOCATION (TO BE APPLIED NEXT TIME STEP)
+double SX[NP1+1]; //TODO zero indexed in fortran! // NORMAL STRESS
+double SXNEW[NP1+1]; //TODO zero indexed in fortran! // NEW NORMAL STRESS (TO BE APPLIED NEXT TIME STEP)
+double P[N+1]; //TODO zero indexed in fortran! // PRESSURE
+double SXD[N]; // DEVIATORIC STRESS
+double SXDNEW[N]; // NEW DEVIATORIC STRESS (TO BE APPLIED NEXT TIME STEP)
+double SZD[N]; // DEVIATORIC STRESS (FOR CYLINDRICAL GEOMETRIES)
+double SZDNEW[N]; // NEW DEVIATORIC STRESS (TO BE APPLIED NEXT TIME STEP)
+double PHI[NP1+1]; //TODO zero indexed in fortran! // DIFFERENCE BETWEEN LONGITUDINAL AND TRANSVERSE STRESS
+
+double RHO[NP1+1]; //TODO zero indexed in fortran! // DENSITY
+double RHONEW[NP1+1]; //TODO zero indexed in fortran! // NEW DENSITY (TO BE APPLIED NEXT TIME STEP)
+double Q[NP1+1]; //TODO zero indexed in fortran! // ARTIFICIAL VISCOSITY
+double C[N]; // LOCAL SOUND SPEED
+double XQUAL[NP1]; // QUALITY (VAPOR MASS FRACTION) IN A ZONE
+double VOLF[NP1]; // VAPOR VOLUME FRACTION IN A ZONE
+double RATEJ[N]; // LOG OF BUBBLE NUCLEATION RATE
+double TNUC[N]; // LOG OF INDUCTION TIME FOR NUCLEATION RATE DEVELOPMENT (STEADY?)
+double BUBBLE[N]; // LOG OF CUMULATIVE NUMBER OF BUBBLES PER UNIT VOLUME
+double QP1[N]; // QUANTITY FOR MOSS & WHITE ARTIFICIAL VISCOSITY
+double QP2[N]; // QUANTITY FOR MOSS & WHITE ARTIFICIAL VISCOSITY
+double SURFCSTUFF[10]; // QUANTITIES FOR SURFACE ZONE CONDUCTION ITERATIONS
+double PLASTIC[N]; // FLAG 1 FOR ZONE WHERE PLASTICITY OCCURED, OTHERWISE 0
+double RATIO[N];
+double TPP[N];
+double TPPP[N];
+double TP[N];
+double HINP[N];
+double HCONDP[N];
+double HDEVP[N];
+double HSTRESSP[N];
+double HSTRESSQP[N];
+double F1P[N];
+double F2P[N];
+double DELRHOP[N];
+
+int GEOM, QFLAG, PLASTIC, USEYIELDFLAG;
+char TAB;
+char JUNK;
+string MATNAME;
+double MOMSUM, MYERF;
+
+//variable to use in DENGEOM, it is not defined in former fortran implicitly,
+//but rather by [O-Z] notation
+double RDEN;
+
+//TODO ???
+EXTERNAL TSURF, PSURF, ZBRENT, CONDSURF, QTWO, ERF
+
+// common blocks converted to global struct
+// TODO rework this
+struct PULSE {
+	double TSQ;
+	double ESQ;
+	double EGAUSS;
+	double SC;
+	double FWHM;
+};
+struct MATDAT {
+	double TMELT;
+	double HMELTI;
+	double HMELTT;
+	double ACOND;
+	double AH2T;
+}s_matdat;
+struct EOSDAT {
+	double RHO0;
+	double EOSCOEF;
+	double ABOIL;
+	double BBOIL;
+	double PRNU;
+	double YIELDCOEF;
+}s_eosdat;
+struct EINTEGRAL {
+	double ELEAKOLD;
+	double ELEAK;
+	double EIN;
+};
+struct OPACBINS {
+	double BIN;
+	double BINW;
+};
+struct SURFT {
+	double HGSURF;
+	double QUALSURFT;
+};
+struct SURFP {
+	double RHOSURF;
+	double QUALSURFP;
+	double HGVSURF;
+	double HGLSURF;
+	double TEMPSURF;
+};
+struct SURFC {
+	double SURFCSTUFF;
+};
+struct SURFTEN {
+	double SIGMACOEF;
+};
+
+//functions prototypes
+void READMAT();
+void ZONESET(double& rho0,double x0[], double xc[], double xloc[],double zmass[],int& geom, ifstream& file);
+
+
+// DEFINE A BLACKBODY FUNCTION
+double BBE(int JBB, int TBB) {
+	return BINW[JBB] * (pow((BIN(JBB)/TBB),3)) / (exp(BIN[JBB]/TBB)-1.0);
+}
+
+int main(int argc, char **argv) {
+	TAB = '\t';
+	ifstream file9; //initdata //TODO rename
+	ifstream file8; //opacdata //TODO rename
+	ifstream file10; // ldepfrac, also Pfront //TODO rename
+	ifstream file11; // Pprofile
+	ifstream file13; // SXProfile
+	ifstream file14; // SXDprofile
+	ifstream file27; // Qprofile
+	ifstream file26; // Aprofile
+	ifstream file15; // Uprofile
+	ifstream file16; // Xprofile
+	ifstream file17; // RHOprofile
+	ifstream file18; // QUALprofile
+	ifstream file19; // Tprofile
+	ifstream file20; // HGprofile
+	ifstream file21; // spall
+	ifstream file22; // VOLFprofile
+	ifstream file24; // TNUCprofile
+	ifstream file25; // Jprofile
+	ifstream file35; // BUBprofile
+	ifstream file28; // PLASTICprofile
+	ifstream file29; // RATIOprofile
+	ifstream file30; // TPPprofile
+	ifstream file31; // TPPPprofile
+	ifstream file32; // EINprofile
+	ifstream file33; // TPprofile
+	ifstream file34; // ESUMDIFprofile
+	ifstream file36; // ESUMprofile
+	ifstream file37; // HINprofile
+	ifstream file38; // HCONDprofile
+	ifstream file39; // HDEVprofile
+	ifstream file40; // HSTRESSprofile
+	ifstream file41; // F1profile
+	ifstream file42; // F2profile
+	ifstream file43; // DELRHOprofile
+	ifstream file44; // EKINprofile
+	ifstream file45; // ESUMVAPprofile
+	ifstream file46; // ESUMSLprofile
+	ifstream file47; // ESUMDIFVAPprofile
+	ifstream file48; // ESUMDIFSLprofile
+	ifstream file49; // MOMprofile
+
+	string COMMENT;
+	int LASERFLAG;
+	int ISOURCE;
+	double RADIUS, AREA;
+	int ISPALL, ISURF;
+
+	// READ RADIATION SOURCE DATA FROM A FILE
+	file9.open("initdata", ifstream::in);
+
+//	WRITE(*,*) 'BB X-ray or laser source? (1=Laser)'
+//	READ(*,*) LASERFLAG
+	comment = FortranIO::read_string(file9);
+	LASERFLAG = FortranIO::read_int(file9);
+
+	if (LASERFLAG != 1) {
+		file8.open("opacdata", ifstream::in);
+		MATNAME = FortranIO::read_string(file8);
+		cout << MATNAME << endl;
+		DO 2, J=1,NBIN
+			READ(8,101) BIN(J),JUNK,BINW(J),JUNK,OPAC(J) // TODO
+2		CONTINUE
+		file8.close();
+		//  SKIP READING ABS.COEFF. FROM THE FILE
+		COMMENT = FortranIO::read_string(file9);
+		COMMENT = FortranIO::read_string(file9);
+
+	} else {
+		// 		WRITE(*,*) 'Enter absorbtion coefficient in reciprocal microns: '
+		// 		READ(*,*) OPACLASER
+		COMMENT = FortranIO::read_string(file9);
+		OPACLASER = FortranIO::read_double(file9);
+
+		for (int j=1; j<NBIN; j++) {
+			BIN[j] = 0;
+			BINW[j] = 0;
+			OPAC[j] = OPACLASER * 1e+06;
+		}
+	}
+
+	//  READ IN MATERIAL PROPERTIES
+	READMAT();
+	GAMMA = EOSCOEF[8];
+	RBAR = EOSCOEF[9];
+
+	//  SHEAR MODULUS COEFFICIENT, BASED ON POISSON'S RATIO
+	GNU = (1.0-2.0*PRNU) / (2.0*(1.0-PRNU));
+	//  SOUND SPEED COEFFICIENT, BASED ON POISSONS' RATIO
+	SNU = sqrt(3.0* (1.0-PRNU)/(1.0+PRNU));
+
+	//  CHOOSE ARTIFICIAL VISCOSITY METHOD
+	// WRITE(*,*) 'Artificial viscosity method'
+	// WRITE(*,*) '	1 = VNR'
+	// WRITE(*,*) '	2 = M&W'
+	// READ(*,*) QFLAG
+	QFLAG = 1;
+
+	//  INITIALIZE ARTIFICIAL VISCOSITY COEFFICIENTS
+	//  B1, B2 ARE FOR SOLID, B3 FOR SPALLED MATERIAL (NOT USED)
+	B1 = 1.000;
+	B2 = 0.300;
+// 	B3 = 0.060
+
+	//  INITIALIZE TIME STEP CONTROL COEFFICIENTS
+	CT1 = 0.9;
+	CT2 = 1.1;
+	// 	CFL MUST BE < 0.5
+	CFL = 0.4;
+
+	//  SET SPALL STRESS (FOR REMOVAL OF MELTED MATERIAL) (in Pa)
+	SPALL = -1.0e+10;
+
+	//  SET UP ZONES
+	//  GEOM IS FLAG FOR PLANAR (1), CYLINDRICAL (2) OR SPHERICAL (3)
+
+	/*   POZNAMKA PRO DRUIDA, tady to bude treba rozsirit a predat jako 
+	     posledni parametr soubor cislo devet, v zonesetu 
+	*/
+	ZONESET(RHO0,X0,XC,XLOC,ZMASS,GEOM);
+	if (GEOM == 1)
+		cout << "PLANAR" << endl;
+	if (GEOM == 2) 
+		cout << "CYLINDRICAL" << endl;
+	if (GEOM == 3) 
+		cout << "SPHERICAL" << endl;
+	if (GEOM < 1 || GEOM > 3) {
+		cout << "Invalid GEOM = " << GEOM;
+		return 1;
+	}
+
+	//  CHOOSE SOURCE TERM
+	do {
+		// 	WRITE(*,*) 'Choose pulse type'
+		// 	WRITE(*,*) '1 = square pulse'
+		// 	WRITE(*,*) '2 = Gaussian pulse'
+		// 	READ(*,*) ISOURCE
+		COMMENT = FortranIO::read_string(file9);
+		ISOURCE = FortranIO::read_int(file9);
+	} while (ISOURCE > 2 || ISOURCE < 1);
+
+	//  SET UP FOR ENERGY DEPOSITION BASED ON ISOURCE CHOICE
+	XSOURCE(ISOURCE,LASERFLAG,FBBLEAK,TSTART);
+	
+// 	WRITE(*,*) 'Enter radius (microns)'
+// 	READ(*,*) RADIUS
+	COMMENT = FortranIO::read_string(file9);
+	RADIUS = FortranIO::read_double(file9);
+	AREA = PI * pow(RADIUS * 1e-06, 2);
+
+	COMMENT = FortranIO::read_string(file9);
+	USEYIELDFLAG = FortranIO::read_int(file9);
+	cout << 'yield: ' << USEYIELDFLAG;
+	
+	LHYDRO = 1;
+
+	HG0 = 0.0;
+	TINF=AH2T(1);
+
+	//  DETEREMINE INITIAL TIME STEP
+	//  ROOM TEMPERATURE MATERIAL PROPERTIES, TO GET THINGS STARTED
+	//  FIRST GET HEAT CAPACITY AT ROOM TEMPERATURE
+	H2T(HG0,T0);
+	H1 = HG0 + 0.1;
+	H2T(H1,T1);
+	CVS = (H1 - HG0) / (T1 - T0);
+	//  NOW GET HEAT CAPACITY OF LIQUID
+	CVL = 1.0 / AH2T(8);
+	//  CHOOSE MINIMUM FOR USE IN TIME STEP CALCULATION
+	CV0 = min(CVS,CVL);
+
+	//  J/kg.K
+	VASAN = 0.0;
+	CONDVST(TINF,VASAN,COND);
+	//  W/m.K
+	ALPHA = COND / (RHO0 * CV0);
+	//  m2/sec
+	DTHEAT = CFL* pow(X0(1)-X0(0), 2) / ALPHA;
+
+	//  SET PROBLEM TIME (sec) AND FLAGS FOR OCCASSIONAL DATA DUMPS (ns)
+// 	WRITE(*,*) 'Enter Tstop (ns)'
+// 	READ (*,*) TSTOP
+	COMMENT = FortranIO::read_string(file9);
+	TSTOP = FortranIO::read_double(file9);
+	file9.close();
+	TM = TSTART * 1.0e-09;
+	TSTOP = TSTOP * 1.0e-09 + 2.0*DTHEAT;
+	TFRONT = TSTART - 1.0e-13; 
+	TSCREEN = TSTART - 1.0e-13;
+
+	XMELTMAX = 0.0;
+	XTMELTMAX = 0.0;
+	TFMAX = TINF;
+	HGFMAX = HG0;
+	DHGMXMAX = 0.0;
+
+	//  INITIALIZE ENERGIES AND TEMPERATURES
+	//  ZONE ENERGY STORED IN H(), SPECIFIC ENERGY STORED IN HG()
+	for (int i=0; i<N; i++) {
+		HINP[i] = 0.0;
+		HCONDP[i] = 0.0;
+		HDEVP[i] = 0.0;
+		HSTRESSP[I] = 0.0;
+		HSTRESSQP[I] = 0.0;
+		H[I] = HG0 * ZMASS[i];
+		HG[I] = HG0;
+		T[I+1] = TINF;
+	}
+	T[0] = TINF;
+	T[NP1] = TINF;
+
+	//  INITIALIZE HYDRO-MOTION VARIABLES
+	EOSF(RHO0,F1,F2);
+	P0 = F1 + F2 * HG0;
+	SOUND(HG0,RHO0,P0,F2,C0);
+	//  CONVERT SOUND TO ELASTIC FROM HYDRODYNAMIC MATERIAL
+	C0 = C0 * SNU;
+	for (int i=0; i<N; i++) {
+		A[i+1] = 0.00e+00;
+		U[i+1] = 0.00e+00;
+		X[i+1] = X0[i+1];
+		RHO[i+1] = RHO0;
+		Q[i+1] = 0.00e+00;
+		P[i+1] = P0;
+		SX[i+1] = 0.00e+00;
+		SXD[i] = 0.00e+00;
+		PHI[i+1] = 0.00e+00;
+		C[i] = C0;
+		XQUAL[i] = 0.00e+00;
+		VOLF[i] = 0.00e+00;
+		QP1[i] = 0.0e+00;
+		QP2[i] = 0.0e+00;
+		BUBBLE[i] = 0.0e+00;
+	}
+
+	//  ASSUME FREE BOUNDARY AT FRONT
+	U[0] = 0.00e+00;
+	X[0] = X0[0];
+	RHO[0] = 0.00e+00;
+	RHONEW[0] = 0.00e+00;
+	SX[0] = 0.00e+00;
+	P[0] = 0.00e+00;
+	PHI[0] = 0.00e+00;
+	Q[0] = 0.00e+00;
+	//  ASSUME NON-REFLECTING BOUNDARY AT BACK
+	U[NP1] = 0.00e+00;
+	UNOLD = 0.00e+00;
+	X[NP1] = X0[NP1];
+	RHO[NP1] = 0.00e+00;
+	SX[NP1] = 0.00e+00;
+	PHI[NP1] = 0.00e+00;
+	Q[NP1] = 0.00e+00;
+	XQUAL[NP1] = 0.00e+00;
+	VOLF[NP1] = 0.00e+00;
+
+	//  INITIALIZE LIQUID DENSITY (FOR SURFACE VAPORIZATION)
+	RHOLSURF = RHO0;
+
+	//  SET INITIAL SPALL ZONE AND FRONT SURFACE ZONE
+	ISPALL = 0;
+	ISURF = 1;
+
+	//  SET MIN QUALITY FOR SURFACE ZONE TO BE CONSIDERED W/O VAPOR
+	QMIN = 1.0e-06;
+
+	//  SET INITIAL TIME STEP SIZE
+	DTHYDRO = (X0[1]-X0[0])/C0;
+	DT = min(DTHEAT,DTHYDRO);
+	if (LHYDRO != 1) DT = DTHEAT;
+	DTOLD = DT;
+
+	//  SET UP SOURCE ENERGY MULTIPLIERS
+	//  WILL GIVE FRACTION OF ENERGY IN EACH ZONE, IN EACH BIN
+	//  OF THE TOTAL INCIDENT FROM WALL AND LEAK X RAYS
+	//  SCALE LEAK ENERGY WITH LAMBERTIAN DISTRIBUTION
+	for (int j=0; j<NBIN; j++) {
+		FRACIN = 1.0;
+		for (int i=0; i<N; i++) {
+			FRACOUT = exp(-X[i+1] * OPAC[J]);
+			EFRAC[i][j] = FRACIN - FRACOUT;
+			FRACIN = FRACOUT;
+		}
+
+		//  INITIALIZE ENERGIES/BIN FOR FIRST TIME STEP
+		ELEAKOLD[j] = 0.0;
+// 		WRITE(*,*) EFRAC(1,J)
+	}
+
+	for (int j=0; j<NBIN; j++) {
+		SUMEFRAC = 0.0;
+		for (int i=0; i<N; i++) {
+			SUMEFRAC = SUMEFRAC + EFRAC[i][j];
+		}
+// 		WRITE(*,*) J,SUMEFRAC
+	}
+
+//  SAVE ENERGY FRACTION IN EACH ZONE
+	for (int i=0; i<N; i++) {
+		EZONE[i] = 0.0e+00;
+		for (int j=0; j<NBIN; j++) {
+			EZONE[i] = EZONE[i] + EFRAC[i][j];
+		}
+	}
+
+// 	SUMALEAK = 0.
+// 	WRITE(*,*) '3.FBBLEAK(J):'
+// 	DO J=1,NBIN
+// 		SUMALEAK = SUMALEAK + FBBLEAK(J)
+// 		WRITE(*,*) FBBLEAK(J)
+// 	END DO
+// 	WRITE(*,*) '3.SUMALEAK=',SUMALEAK
+
+	//  FOR LASER SOURCE, RECORD ENERGY DEPOSITION PROFILE
+	if (LASERFLAG == 1) {
+		file10.open("ldepfrac", iostream::in);
+		for (int i=0; i<N; i++) {
+			WRITE (10,111) I, X0[i+1]*1.0e+06, EFRAC[i][0] // TODO
+		}
+		file10.close();
+	}
+
+	file10.open("Pfront");
+	file11.open("Pprofile");
+	file13.open("SXProfile");
+	file14.open("SXDprofile"); 
+	file27.open("Qprofile");
+	file26.open("Aprofile");
+	file15.open("Uprofile");
+	file16.open("Xprofile");
+	file17.open("RHOprofile");
+	file18.open("QUALprofile");
+	file19.open("Tprofile");
+	file20.open("HGprofile");
+	file21.open("spall");
+	file22.open("VOLFprofile");
+	file24.open("TNUCprofile");
+	file25.open("Jprofile");
+	file35.open("BUBprofile");
+	file28.open("PLASTICprofile");
+	file29.open("RATIOprofile");
+	file30.open("TPPprofile");
+	file31.open("TPPPprofile");
+	file32.open("EINprofile");
+	file33.open("TPprofile");
+	file34.open("ESUMDIFprofile");
+	file36.open("ESUMprofile");
+	file37.open("HINprofile");
+	file38.open("HCONDprofile");
+	file39.open("HDEVprofile");
+	file40.open("HSTRESSprofile");
+	file41.open("F1profile");
+	file42.open("F2profile");
+	file43.open("DELRHOprofile");
+	file44.open("EKINprofile");
+	file45.open("ESUMVAPprofile");
+	file46.open("ESUMSLprofile");
+	file47.open("ESUMDIFVAPprofile");
+	file48.open("ESUMDIFSLprofile");
+	file49.open("MOMprofile");
+
+	ISURFEND = 23;
+	EKINSIGN = 1;
+	EINMAX = 0.0;
+	EINMAXVAP = 0.0;
+	EINMAXSL = 0.0;
+	DTMIN = 100.0;
+	DTMAX = 0.0;
+	HEASTMAX = 0.0;
+	DHGMXMAX = 0.0;
+	if (GEOM > 1 && X0[0] == 0.0) {
+		IFLAGAXIS = 1;
+	} else {
+		IFLAGAXIS = 0;
+	}
+	
+	//  INITIALIZE MAX BUBBLE NUCLEATION DEPTHS AND ZONE NUMBERS
+	I35 = 1;
+	I30 = 1;
+	I25 = 1;
+	I20 = 1;
+	X35 = 0.0;
+	X30 = 0.0;
+	X25 = 0.0;
+	X20 = 0.0;
+	IB27 = 1;
+	IB26 = 1;
+	IB25 = 1;
+	IB24 = 1;
+	XB27 = 0.0;
+	XB26 = 0.0;
+	XB25 = 0.0;
+	XB24 = 0.0;
+	//  INIT PLASTICITY FLAG
+	PLASTICFLAG = 0;
+
+	//  SET UP TO PRINT INFO TO SCREEN EVERY NCYCLEPRINT CYCLES
+	NCYCLEPRINT = 10000;
+	NCYCLE = 1;
+	TPRESS = TM * 1.0e+09;
+	TPRESSEIN = TPRESS;
+
+	//  *******************************************************
+	//  START MARCHING IN TM
+20	CONTINUE
+	TM = TM + DT
+	IF (TM .GT. TSTOP) GOTO 95
+
+//  SET UP MAGNITUDE OF ENERGY PULSES
+//  RETURNS ENERGY IN EACH BIN FOR THIS TIME STEP, EIN(J) IN COMMON
+	CALL XPULSE(TM,ISOURCE,AREA,FBBLEAK)
+
+//  ADD THE TOTAL ENERGY DEPOSITED THIS STEP TO RUNNING TOTAL
+	EINDT=0.0
+	DO 39, J=1,NBIN
+		EINMAX = EINMAX + EIN(J)
+		EINDT = EINDT + EIN(J)
+39	CONTINUE
+
+//  RESET MAX SPECIFIC ENERGY CHANGE
+	DHGMAX = 0.0
+//  RESET SPALL FLAG
+	ISPALLFLAG = 0
+
+//  SET UP THERMAL CONDUCTIVITIES FOR THE FIRST ZONE
+	VFLAG = VOLF(1)
+	IF (ISURF .EQ. 1) VFLAG = 0.0D+00
+	CALL CONDVST(T(1),VFLAG,CONDE)
+	CALL BETAGEOM(GEOM,X(0),X(1),BETAC)
+	AE = CONDE * BETAC / (X(1) - X(0))
+//  INSULATED FRONT SURFACE (CONDUCTION BETWEEN ZONES 0 AND 1)
+	HEAST = 0.0D+00
+//  SET PLASTICITY FLAG FOR EACH ZONE
+	DO I=1,N
+		PLASTIC(I) = 0
+	ENDDO
+
+	IF (LHYDRO .EQ. 1) THEN
+//  SET UP FOR FINDING NEW HYDRO-BASED MAXIMUM DT
+	DTHYDRO = 100.
+	IF (ISURF .EQ. 1 .AND. XQUAL(ISURF) .GT. QMIN) THEN
+//  DETERMINE LEFT NODE MOTION OF SURF ZONE W/O F=MA
+		TRIGHT = T(1)
+		PRIGHT = P(1)
+		PLEFT = P(0)
+		CALL USURFIX(TRIGHT,PRIGHT,PLEFT,UNEW)
+		A(0) = (UNEW - U(0)) / DT
+		U(0) = UNEW
+		XNEW(0) = X(0) + DT * U(0)
+	ELSE
+		IF (GEOM .EQ. 1) THEN
+//  DETERMINE ACCELERATION, VELOCITY, LOCATION FOR LEFT EDGE
+			A(0) = 2. * (0.0 - (SX(1)+Q(1))) /
+     &				(RHO(1) * (X(1) - X(0)) + 0.0)
+			U(0) = U(0) + A(0) * (DT + DTOLD)/2.
+			XNEW(0) = X(0) + DT * U(0)
+		ELSE
+//  CHECK IF INNER RADIUS HAS ALREADY HIT AXIS
+			IF (IFLAGAXIS .EQ. 0) THEN
+				A(0) = 2. * (0. - (SX(1)+Q(1))) /
+     &					(RHO(1)*(X(1)+X(0)) + 0.) + 
+     &					2. * (GEOM-1) * (PHI(1) + PHI(0)) / 
+     &					(RHO(1)*(X(1) + X(0)) + 0.)
+				UNEW = U(0) + A(0) * (DT + DTOLD)/2.
+				XNEW0 = X(0) + DT * UNEW
+//  CHECK IF SURFACE HAS PASSED THROUGH AXIS
+				IF (XNEW0 .LE. 0.0) THEN
+//  KEEPING SAME ACCELERATION, FIGURE DT TO WHEN STUFF HITS AT CENTER
+					CALL AXIS(X(0),U(0),A(0),DTOLD,DTNEW)
+					DT = DTNEW
+					XNEW(0) = 0.0
+					U(0) = 0.0
+					IFLAGAXIS = 1
+				ELSE
+					U(0) = UNEW
+					XNEW(0) = XNEW0
+				END IF
+			END IF
+		END IF
+	END IF
+	END IF
+
+
+//  %%%%%%%%%%%%%%%%%%%%%% START OF LOOP THROUGH ZONES %%%%%%%%%%%%%%%%%%%%%%
+//  FRONT BC IS THERMALLY INSULATED
+//  REAR BC IS AT FIXED TEMPERATURE
+//  FRONT SURFACE IS FREE TO MOVE
+//  REAR SURFACE IS NON-REFLECTING
+
+	DO 50, I=1,N
+	IF (LHYDRO .EQ. 1) THEN
+//  COMPUTE ACCELERATION, VELOCITY, LOCATION
+		IF (I .EQ. (ISURF-1) .AND. XQUAL(ISURF) .GT. QMIN .AND. 
+     &			VOLF(I) .GT. 0.99) THEN
+//  DETERMINE RIGHT NODE MOTION OF ISURF ZONE W/ ADJUSTED PRESSURE
+			PRIGHT = P(ISURF)
+			DXSURF = (X(ISURF)-X(I)) * (1.0D+00-VOLF(ISURF))
+			XINTERNAL = X(ISURF) - DXSURF
+			DXC1 = XINTERNAL - XC(I)
+			DX1 = XINTERNAL - X(I)
+			CALL PLEFTCALC(PRIGHT,P(I),DXC1,DX1,RHOVSURF,
+     &				XQUAL(ISURF),T(ISURF),PLEFT)
+			A(I) = 2. * ((SX(I)+Q(I)) - (PLEFT+Q(I+1))) /
+     &				(RHO(I+1)*(X(I+1)-X(I)) + RHO(I)*(X(I)-X(I-1))) + 
+     &				2.* (GEOM-1) * (PHI(I) - PHI(I+1)) / 
+     &				(RHO(I+1)*(X(I+1)+X(I)) + RHO(I)*(X(I-1)+X(I)))
+			U(I) = U(I) + A(I) * (DT+DTOLD)/2.
+
+		ELSE IF (I .LT. N) THEN
+			A(I) = 2. * ((SX(I)+Q(I)) - (SX(I+1)+Q(I+1))) / 
+     &				(RHO(I+1)*(X(I+1)-X(I)) + RHO(I)*(X(I)-X(I-1))) + 
+     &				2.* (GEOM-1) * (PHI(I) - PHI(I+1)) / 
+     &				(RHO(I+1)*(X(I+1)+X(I)) + RHO(I)*(X(I-1)+X(I)))
+			U(I) = U(I) + A(I) * (DT+DTOLD)/2.
+		ELSE
+//  NON-REFLECTING BOUNDARY CONDITION (NRBC)
+//  BASED ON HALPERN, 1982
+			DXNRBC = X(N) - X(N-1)
+			TNRBC0 = 2.*((C(N)*DT)**2) / (C(N)*DT+DXNRBC)
+			TNRBC1 = (-1./DXNRBC) + (DXNRBC/(C(N)*DT)**2)
+			TNRBC2 = (C(N)*DT-DXNRBC)/(2.*(C(N)*DT)**2)
+			TNRBC3 = 1./DXNRBC
+			UNEW = TNRBC0*(U(N)*TNRBC1+UNOLD*TNRBC2+U(N-1)*TNRBC3)
+			UNOLD = U(N)
+			U(N) = UNEW
+			A(N) = U(N) / DT
+		END IF
+		
+		XNEW(I) = X(I) + DT * U(I)
+//  COMPUTE NEW DENSITY FROM ZONE MASS
+		CALL DENGEOM(GEOM,XNEW(I-1),XNEW(I),RDEN)
+		RHONEW(I) = ZMASS(I) / ((XNEW(I) - XNEW(I-1)) * RDEN)
+		RHOBAR = (RHONEW(I) + RHO(I)) / 2.
+		DELRHO = 0.5 * (RHONEW(I)-RHO(I))/RHOBAR**2
+		RHODOT = (RHONEW(I)-RHO(I))/(DT*RHOBAR)
+
+//  COMPUTE FACTORS FOR LINEAR (IN ENERGY) EOS
+		RHOEOS = RHONEW(I)
+		IF (I .EQ. ISURF) THEN
+//  SPECIAL TREATMENT FOR VAPORIZING SURFACE ZONE
+			CALL FSURF(RHOEOS,RHOLSURF,XQUAL(ISURF),QMIN,F1,F2)
+		ELSE IF (I .GT. ISPALL) THEN
+//  SOLID/LIQUID ZONE
+			CALL EOSF(RHOEOS,F1,F2)
+		ELSE IF (VOLF(I) .LT. 0.001) THEN
+			CALL EOSF(RHOEOS,F1,F2)
+		ELSE IF (VOLF(I) .GT. 0.999) THEN
+			CALL FVAPOR(RHOEOS,F1,F2)
+		ELSE
+			XQ2 = XQUAL(I)
+			CALL F2PHASE(RHOEOS,HG(I),XQ2,F1,F2)
+		END IF
+
+// OMPUTE ARTIFICIAL VISCOSITY
+		XXXX = (XNEW(I) - XNEW(I-1) + X(I) - X(I-1)) / 2.
+		QLIN = RHOBAR * B2 * XXXX * C(I) * RHODOT
+		QQUAD = RHOBAR * (B1 * XXXX)**2 * RHODOT * ABS(RHODOT)
+//  CHOOSE VON NEUMAN & RICHTMEYER OR MOOS & WHITE FORM
+		IF (QFLAG .EQ. 2) THEN
+//  SET CRITERION FROM MOOS & WHITE
+			QP = SX(I) * (U(I)-U(I-1))/XXXX
+			QPTEST = QP1(I) + (QP1(I)-QP2(I)) * DT/DTOLD
+			QF1 = 0.0
+			QF2 = 0.0
+			IF (QP .GT. 0.) QF1=1.
+			IF (QP .GT. QPTEST) QF2=1.
+			Q(I) = (QQUAD + QLIN) * (QF1 + QF2)
+		ELSE
+//  VON NEUMANN & RICHTMEYER
+			IF (RHODOT .GT. 0.) THEN
+				Q(I) = QLIN + QQUAD
+			ELSE
+				Q(I) = 0.0D+00
+			END IF
+		END IF
+//  TURN OFF ART VISC FOR SURFACE ZONE
+		IF (I .EQ. (ISURF)) THEN
+			Q(I) = 0.0D+00
+		END IF
+
+//  COMPUTE DEVIATORIC STRESSES AND ENERGIES IF SOLID
+// 		IF (T(I) .LT. TMELT .AND. I .GT. ISPALL) THEN
+		IF (0. GT. 1.) THEN
+			DXD = (U(I) - U(I-1)) / XXXX + RHODOT / 3.
+			G = GNU * RHO(I) * C(I)**2
+//  COMPUTE CURRENT YIELD STRENGTH 
+			YIELDFLAG = YIELDCOEF(1)
+			IF (YIELDFLAG .EQ. 1) THEN
+//  USING LINEAR RAMP OF YIELD STRENGTH FROM YIELD0 @ TINF DOWN TO 0 @ TMELT
+				YIELD0 = YIELDCOEF(2)
+				YBIG = YIELD0 * (TMELT-T(I))/(TMELT-TINF)
+			ELSE IF (YIELDFLAG .EQ. 2) THEN
+//  USING EXPONENTIAL FIT
+				CYIELD = YIELDCOEF(2)
+				EYIELD = YIELDCOEF(3)
+				YBIG = CYIELD * DEXP(EYIELD/T(I))
+			END IF
+			SIGMAXD = SXD(I) + 2. * DT * G * DXD
+
+//  SPLIT BASED ON GEOMETRY
+			IF (GEOM .EQ. 1 .OR. GEOM .EQ. 3) THEN
+//  PLANAR OR SPHERICAL
+				YIELDTEST = YBIG * 2./3.
+				IF (ABS(SIGMAXD) .GT. YIELDTEST) THEN
+					PLASTICFLAG = 1
+					PLASTIC(I) = 1
+// 					WRITE(*,*) 'PLASTICITY: ',I,TM
+					IF (USEYIELDFLAG .EQ. 1) THEN
+						SXDNEW(I) = ABS(SIGMAXD)/SIGMAXD * YIELDTEST
+					ELSE
+						SXDNEW(I) = SIGMAXD
+					END IF
+				ELSE
+					SXDNEW(I) = SIGMAXD
+				END IF
+				PHI(I) = 1.5 * SXDNEW(I)
+				DELED = 0.75*DT*DXD*(SXDNEW(I)+SXD(I)) / RHOBAR
+			ELSE
+//  CYLINDRICAL
+				DZD = RHODOT / 3.
+				SIGMAZD = SZD(I) + 2. * DT * G* DZD
+				FY = 2.*(SIGMAXD**2 + SIGMAXD*SIGMAZD + SIGMAZD**2)
+				YIELDTEST = (2./3.) * YBIG**2
+				IF (ABS(SIGMAXD) .GT. YIELDTEST) THEN
+					PLASTICFLAG = 1
+					PLASTIC(I) = 1
+					IF (USEYIELDFLAG .EQ. 1) THEN
+						FSQ = SQRT(YIELDTEST/FY)
+						SXDNEW(I) = SIGMAXD * FSQ
+						SZDNEW(I) = SIGMAZD * FSQ
+					END IF
+				ELSE
+					FSQ = SQRT(YIELDTEST/FY)
+					SXDNEW(I) = SIGMAXD * FSQ
+					SZDNEW(I) = SIGMAZD * FSQ
+				END IF
+				DELED = (DT/(2.*RHOBAR)) * ((SXDNEW(I)+SXD(I))*(2.*DXD+DZD)+
+     &					(SZDNEW(I)+SZD(I))*(2.*DZD+DZD))
+				PHI(I) = 2.*SXDNEW(I) + SZDNEW(I)
+			END IF
+		ELSE
+//  MELTED OR SPALLED MATERIALS
+			DELED = 0.0D+00
+			PHI(I) = 0.0D+00
+			SXDNEW(I) = 0.0D+00
+			SZDNEW(I) = 0.0D+00
+		END IF
+		IF (I .LE. ISPALL) SXDNEW(I) = 0.0
+
+//  COMPUTE STRESS ENERGY CHANGE IN J/m2
+		HSTRESS = (F1 + P(I) + 2.*Q(I)) * DELRHO * ZMASS(I)
+		HSTRESSQ = (F1 + P(I)) * DELRHO * ZMASS(I)
+
+//  COMPUTE DEVIATORIC CONTRIBUTION IN J/m2
+		HDEV = DELED * ZMASS(I)
+	END IF
+//  END IF FOR LHYDRO-ONLY STEPS
+
+//  SET UP SOURCE ENERGY
+//  SUM TO GET NET ENERGY/ZONE
+//  NET ENERGY HAS UNITS OF J/m2
+	HIN = 0.
+	DO 48, J=1,NBIN
+		HIN = HIN + EFRAC(I,J) * EIN(J)
+48	CONTINUE
+	IF (I .LE. ISURFEND) THEN
+		EINMAXVAP = EINMAXVAP + HIN
+	ELSE
+		EINMAXSL = EINMAXSL + HIN
+	END IF
+
+//  HEAT CONDUCTION BALANCE ( (I-1) TO EAST = -(I TO WEST) )
+	HWEST = HEAST
+//  SET CONDUCTION COEFFICIENT FOR THIS ZONE
+	CONDP = CONDE
+	VFLAG = VOLF(I+1)
+	IF (I .EQ. (ISURF-1)) VFLAG = 0.0D+00
+	CALL CONDVST(T(I+1),VFLAG,CONDE)
+	CONDEI = 2. * CONDP * CONDE / (CONDP + CONDE)
+
+//  BASE HEAT CONDUCTION ON TEMP, LOCATIONS, PROPERTIES FROM PREVIOUS TM
+	IF (I .EQ. ISURF) THEN
+//  ADJUST HEAT CONDUCTION DISTANCE TO REFLECT ONLY REMAINING LIQUID
+//  AND SOLVE IMPLICITLY
+		DXSURF = (X(I)-X(I-1)) * (1.0D+00-VOLF(I))
+		XINTERNAL = X(I) - DXSURF
+		CALL BETAGEOM(GEOM,XINTERNAL,X(I),BETAC)
+		DXP1 = XC(I+2) - XC(I+1)
+//  FIGURE WHAT WILL BE HEAT COND BETWEEN (I+1) AND (I+2)
+		CALL CONDVST(T(I+2),VOLF(I+2),CONDE2)
+		CONDEI1 = 2. * CONDE * CONDE2 / (CONDE + CONDE2)
+		CALL BETAGEOM(GEOM,XC(I+1),XC(I+2),BETAC1)
+		AE1 = CONDEI1 * BETAC1 / DXP1
+		HEAST1 = AE1*(T(I+1)-T(I+2))
+//  SET TEMPORARY ENERGIES IN ZONE ISURF AND ISURF+1
+//  + HSTRESS
+		HTEMPP = H(ISURF) + HWEST * DT + HIN + HSTRESS
+		HTEMPE = H(ISURF+1) - HEAST1*DT + HIN*EZONE(I+1)/EZONE(I)
+		HGTEMPP = HTEMPP / ZMASS(ISURF)
+		HGTEMPE = HTEMPE / ZMASS(ISURF+1)
+//  ENHANCE CONDUCTIVITY TO REDUCE SURFACE TEMPERATURE VARIATIONS
+		CONDP = CONDP * (1.0D+00 + 4.*XQUAL(ISURF)**2)
+//  FILL COMMON BLOCKS FOR ITERATION ROUTINE
+		SURFCSTUFF(1) = HTEMPP
+		SURFCSTUFF(2) = HTEMPE
+		SURFCSTUFF(3) = ZMASS(ISURF)
+		SURFCSTUFF(4) = ZMASS(ISURF+1)
+		SURFCSTUFF(5) = DT
+		SURFCSTUFF(6) = QMIN
+		SURFCSTUFF(7) = CONDP
+		SURFCSTUFF(8) = DXSURF
+		SURFCSTUFF(9) = BETAC
+		SURFCSTUFF(10) = T(I)
+		QUALSURFT = XQUAL(I)
+//  SET UP BRACKETING INITIAL GUESSES FOR HEAST BASED ON CURRENT TEMPS
+		HEAST = CONDP * BETAC * (T(I)-T(I+1)) / DXSURF
+
+		CALL BRACKET(CONDSURF,HEAST,HE1,HE2)
+		TOL = 1.0D-05
+		HEAST = ZBRENT(CONDSURF,HE1,HE2,TOL)
+	ELSE
+		CALL BETAGEOM(GEOM,XC(I),XC(I+1),BETAC)
+		DXC = XC(I+1) - XC(I)
+		AE = CONDEI * BETAC / DXC
+		HEAST = AE*(T(I)-T(I+1))
+	END IF
+	IF (HEAST .GT. HEASTMAX) HEASTMAX = HEAST
+//  COMPUTE NET ENERGY CHANGE FROM CONDUCTION
+	HCOND = (HWEST - HEAST) * DT
+
+//  UPDATE TOTAL ZONE AND SPECIFIC ENERGIES
+//  + HSTRESS
+	DH = (HIN+HCOND+HDEV+HSTRESS) / (1.0D+00 - F2*DELRHO)
+	IF (LHYDRO .NE. 1) DH = HIN + HCOND
+	H(I) = H(I) + DH
+	HG(I) = H(I) / ZMASS(I)
+//  STORE EACH ENERGY CONTRIBUTION FOR PRINTING
+	HINP(I) = HINP(I) + HIN / (1.0D+00 - F2*DELRHO)
+	HCONDP(I) = HCONDP(I) + HCOND / (1.0D+00 - F2*DELRHO)
+	HDEVP(I) = HDEVP(I) + HDEV / (1.0D+00 - F2*DELRHO)
+	HSTRESSP(I) = HSTRESSP(I) + HSTRESS / (1.0D+00 - F2*DELRHO)
+	HSTRESSQP(I) = HSTRESSQP(I) + HSTRESSQ / (1.0D+00 - F2*DELRHO)
+
+// 	HSTRESSP(I) = (F1 + P(I) + 2.*Q(I)) * (0.5 / RHOBAR) * ZMASS(I) / (1.0D+00 - F2*DELRHO)
+
+//  CHECK FOR MAXIMUM CHANGE IN ZONE ENERGY/kg
+	DHG = DH / ZMASS(I)
+	IF (DABS(DHG) .GT. DHGMAX) THEN
+		DHGMAX = DABS(DHG)
+		IDHGMAX = I
+		IF (DHGMAX .GT. DHGMXMAX) THEN
+			DHGMXMAX = DHGMAX
+			IDHGMXMAX = I
+		END IF
+	END IF
+
+//  APPLY EOS INFORMATION TO GET PRESSURE, TEMP, SOUND SPEED
+//  DIFFERENT TREATMENTS DEPENDING ON EXPECTED STATE
+
+//  SPECIAL TREATMENT FOR SURFACE ZONE (PRESCRIBED QUALITY FROM SURFACE VAPORIZATION ROUTINE)
+	IF (I .EQ. ISURF) THEN
+		TEMPSURF = T(I)
+		HGSURF = HG(I)
+		QUALSURFT = XQUAL(I)
+		RHOSURF = RHONEW(I)
+		QUALSURFP = XQUAL(I)
+		PM1 = P(I-1)
+		CALL EOSURF(RHOLSURF,RHOVSURF,RHONEW(I+1),QMIN,
+     &			PM1,P(I),VOLF(I),C(I))
+		TNEW(I) = TEMPSURF
+		IF (TNEW(I) .LT. 0.0) THEN
+			WRITE (*,*) 'ERROR IN SURF TEMP'
+			WRITE (*,*) 'T = ',TNEW(I)
+			WRITE (*,*) 'I = ', I
+			WRITE (*,*) 'TIME = ',TM*1.0D+09
+			WRITE (*,*) 'HG (cal/g) = ',HT
+			STOP
+		END IF
+	
+//  USE SOLID/LIQUID EOS FOR UNSPALLED MATERIAL
+	ELSE IF (I .GT. ISPALL) THEN
+//  DETERMINE WHAT THE NEW TEMPERATURE WILL BE
+		HT = HG(I)
+		CALL H2T(HT,TNEW(I))
+		IF (TNEW(I) .LT. 0.0) THEN
+			WRITE (*,*) 'ERROR IN SOLID/LIQUID TEMP'
+			WRITE (*,*) 'T = ',TNEW(I)
+			WRITE (*,*) 'I = ', I
+			WRITE (*,*) 'TIME = ',TM*1.0D+09
+			WRITE (*,*) 'HG (cal/g) = ',HT
+			STOP
+		END IF
+
+//  COMPUTE NEW PRESSURE FROM EOS
+		P(I) = F1 + F2 * HG(I)
+
+//  COMPUTE NEW SOUND SPEED
+		HEOS = HG(I)
+		REOS = RHONEW(I)
+		PEOS = P(I)
+		CALL SOUND(HEOS,REOS,PEOS,F2,CEOS)
+		IF (TNEW(I) .LT. TMELT) THEN
+//  APPLY CORRECTION FOR ELASTIC MATERIAL
+			C(I) = SNU * CEOS
+		ELSE
+			C(I) = CEOS
+		END IF
+
+//  USE "SPALL" OR "VAPOR" EOS FOR SPALLED MATERIAL
+	ELSE
+		TS = T(I)
+		IF (HG(I) .GT. 0.0 .AND. HG(I) .LT. 1.0D+15) THEN
+			CALL EOSPALL(HG(I),RHONEW(I),TS,P(I),XQUAL(I),VOLF(I),C(I))
+			TNEW(I) = TS
+			IF (TNEW(I) .LT. 0.0) THEN
+				WRITE (*,*) 'ERROR IN SPALL TEMP'
+				WRITE (*,*) 'T = ',TNEW(I)
+				WRITE (*,*) 'I = ', I
+				WRITE (*,*) 'TIME = ',TM*1.0D+09
+				WRITE (*,*) 'HG (cal/g) = ',HG(I)
+				WRITE (*,*) 'RHO = ',RHONEW(I)
+				STOP
+			END IF
+		ELSE
+			WRITE (*,*) 'ERROR IN ZONE ENERGY'
+			WRITE (*,*) 'HG (cal/g) = ',HG(I)/4184
+			WRITE (*,*) 'I = ', I
+			WRITE (*,*) 'TIME = ',TM*1.0D+09
+			WRITE (*,*) 'T = ',T(I)
+			WRITE (*,*) 'RHO = ',RHONEW(I)
+			WRITE (*,*) 'QUAL = ',XQUAL(I)
+			STOP
+		END IF
+	END IF
+
+//  COMPUTE NEW SIGMA-X
+	SXNEW(I) = P(I) - SXDNEW(I)
+
+//  COMPUTE MAXIMUM HYDRO TIME STEP FOR THIS ZONE
+	DELTAX = XNEW(I) - XNEW(I-1)
+	DTI = CT1 * DELTAX / 
+     &		(B2*C(I) + 2.*B1**2 * ABS(RHODOT) * DELTAX + 
+     &		SQRT((B2*C(I) + 2.*B1**2 * ABS(RHODOT) * DELTAX)**2 + 
+     &		C(I)**2))
+	IF (DTI .LT. DTHYDRO) THEN
+		DTHYDRO = DTI
+		IHYDRO = I
+	END IF
+
+	TNS = TM * 1.0D+09
+
+//  UPDATE POWERS FOR ARTIFICIAL VISCOSITY SWITCH
+	QP2(I) = QP1(I)
+	QP1(I) = QP
+	
+	IF (LHYDRO .EQ. 1) THEN
+//  CHECK FOR SPALLED ZONE (LIQUID AT NEGATIVE STRESS)
+		TTEST = TMELT + 1.0D-05
+		IF (TNEW(I) .GE. TTEST .AND. I .GT. ISPALL) THEN
+			IF (SXNEW(I) .LT. SPALL) THEN
+				ISPALL = I
+				WRITE(*,*) 'ISPALL melt=',ISPALL
+				WRITE(21,134) TM*1.0D+09,TAB,ISPALL,TAB,
+     &					X0(ISPALL)*1.0D+06
+				ISURF = ISPALL+1
+				ISPALLFLAG = 1
+			END IF
+		END IF
+	END IF
+	F1P(I) = F1
+	F2P(I) = F2
+	DELRHOP(I) = DELRHO
+	
+50	CONTINUE
+//  %%%%%%%%%%%%%%%%%%%%%%% END OF LOOP THROUGH ZONES %%%%%%%%%%%%%%%%%%%%%%%
+
+
+//  UPDATE OLD T, X, XC,RHO, AND SIGMA VALUES
+	X(0) = XNEW(0)
+	T(0) = T(1)
+	DTEMPMAX = 0.0
+	DO 57, I=1,N
+//  STORE FOR LIMITING TIME STEP
+		DTEMP = ABS(T(I)-TNEW(I))
+		IF (DTEMP .GT. DTEMPMAX) THEN
+			DTEMPMAX = DTEMP
+			ITEMPMAX = I
+		END IF
+		T(I) = TNEW(I)
+		X(I) = XNEW(I)
+		XC(I) = (X(I) + X(I-1)) / 2.
+		RHO(I) = RHONEW(I)
+		SX(I) = SXNEW(I)
+		SXD(I) = SXDNEW(I)
+//  *** TO JSEM PRIDAL JA ***
+		SZD(I) = SZDNEW(I)
+57	CONTINUE
+	T(N) = TINF
+
+//  DETERMINE MELT DEPTH, IF ANY
+	TMLOW = TMELT - 0.1
+	TMHIGH = TMELT + 0.1
+	IF (T(1) .GE. TMLOW) THEN
+		DO 64, I=ISPALL+1,N
+			IF (T(I) .LT. TMLOW .AND. T(I-1) .GE. TMLOW) THEN
+				XMELT = XLOC(I-1)
+			END IF
+			IF (T(I) .LT. TMHIGH .AND. T(I-1) .GE. TMHIGH) THEN
+				XTMELT = XLOC(I-1)
+			END IF
+64		CONTINUE
+		IF (XMELT .GT. XMELTMAX) XMELTMAX = XMELT
+		IF (XTMELT .GT. XTMELTMAX) THEN 
+			XTMELTMAX = XTMELT
+		END IF
+	ELSE
+		XMELT = 0.0
+		XTMELT = 0.0
+	END IF
+	
+//  SURFACE VAPORIZATION SECTION
+//  COMPUTE VAPORIZED MASS AND ENERGY IN THIS TIME STEP
+//  FIRST SET AMBIENT PRESSURE
+	IF (ISURF .EQ. 1) THEN
+		PAMB = 1.33D-04
+	ELSE
+		PAMB = P(ISURF-1)
+	END IF
+	DTVAP = 100.
+	CALL SURFVAP(GEOM,PAMB,TNEW(ISURF),XNEW(ISURF),DT,
+     &		DVAPMASS,DHVAP)
+
+//  GET NEW QUALITY (MASS FRACTION OF VAPOR) IN SURFACE ZONE
+	DXQ = DVAPMASS / ZMASS(ISURF)
+	XQ = XQUAL(ISURF) + DXQ
+	
+	IF (XQ .LT. 1.0D+00) THEN
+		XQUAL(ISURF) = XQ
+	ELSE
+//  SPALL OFF THIS ZONE AND ADVANCE ISURF
+		DQI = 1.0D+00 - XQUAL(ISURF)
+		XQUAL(ISURF) = 1.0D+00
+		VOLF(ISURF) = 1.0D+00
+		DVAPMASS = ZMASS(ISURF) * (XQ - 1.0D+00)
+		ISPALL = ISURF
+		ISURF = ISURF + 1
+		WRITE(*,*) 'ISURFvapor =',ISPALL
+		WRITE(*,*) 'TIME =',TM*1.0D+09
+		WRITE(*,*) 'CYCLE =',NCYCLE
+		WRITE(21,134) TM*1.0D+09,TAB,ISPALL,TAB,
+     &			X0(ISPALL)*1.0D+06
+
+//  SET UP NEXT SURFACE ZONE PROPERLY
+		DXQ = DVAPMASS / ZMASS(ISURF)
+		XQUAL(ISURF) = DXQ
+		RHOV = P(ISURF) / (RBAR * T(ISURF))
+//  *** TO JSEM ZMENIL JA (VOLF = QUAL * RHO / RHOV) ***
+		VOLF(ISURF) = XQUAL(ISURF) * RHO(ISURF) / RHOV
+// 		VOLF = QUAL * RHO / RHOV
+		
+		RHOLSURF = RHO(ISURF)
+		ISPALLFLAG = 1
+	END IF
+//  END OF SURFACE VAPORIZATION SECTION
+
+//  SET NEW TIME STEP TO PREVENT EXCESSIVE VAPORIZATION NEXT STEP
+	IF (ISPALLFLAG .EQ. 1) THEN
+		CALL SURFVAP(GEOM,PAMB,TNEW(ISURF),XNEW(ISURF),DT,
+     &			DVMNEXT,DHVAPN)
+		VAPRATIO = DVMNEXT / ZMASS(ISURF)
+		IF (VAPRATIO .GT. 0.02) THEN
+			DTVAP = DT * 0.02 / VAPRATIO
+		END IF
+	END IF
+
+//  KEEP TRACK OF MAXIMUM FRONT SURFACE ENERGY
+	IF (HG(1) .GT. HGFMAX) THEN
+		HGFMAX = HG(1)
+	END IF
+
+//  *** TO JSEM PRIDAL JA, PRI HG(UP) MUZE T(DOWN) (VYPAROVANI) ***
+//  KEEP TRACK OF MAXIMUM FRONT SURFACE TEMPERATURE
+	IF (T(1) .GT. TFMAX) THEN
+		TFMAX = T(1)
+	END IF
+
+//  WRITE SURFACE ZONE PRESSURE TO A FILE FOR A WHILE
+	TNS = TM * 1.0D+09
+	IF (TNS .LT. 3.) THEN
+		WRITE(10,155) TNS,TAB,ISURF,TAB,P(ISURF),
+     &			TAB,T(ISURF),TAB,T(ISURF+1)
+	END IF
+
+//  CHECK ENERGY BALANCE
+	HSUM = 0.0
+	EKIN = 0.0
+	DO 92, I=1,N
+// 		HSUM = HSUM + H(I) - HSTRESS(I)
+          HSUM = HSUM + H(I) - HSTRESS
+		UBAR = (U(I) + EKINSIGN*U(I-1)) / 2.
+		EKIN = EKIN + 0.5 * ZMASS(I) * UBAR**2
+92	CONTINUE
+	ESUM = HSUM + EKIN
+
+//  OUTPUT FOR DIAGNOSTIC PURPOSES
+	NCYMOD = MOD(NCYCLE,NCYCLEPRINT)
+	IF (NCYMOD .EQ. 0) THEN
+		TNS = TM * 1.0D+09
+		WRITE(*,*) 'TIME',TM*1.0D+09
+		K1 = ISPALL + 1
+		K2 = ISPALL + NSAVE
+		WRITE(*,139) 'U		', (U(K),K=K1,K2)
+		WRITE(*,139) 'P		', (P(K),K=K1,K2)
+		WRITE(*,139) 'T		', (T(K),K=K1,K2)
+		WRITE(*,136) ESUM/10000.0, EINMAX/10000.0
+	END IF
+	NCYCLE = NCYCLE + 1
+	
+//  DETERMINE NEW HEAT TIME STEP FROM CFL CONSTRAINT
+	DTHEAT = 1.0D+02
+	DO 70, I=1,N
+		IF (T(I) .LT. 0.0) THEN
+			WRITE(*,*) 'cfl T =',T(I)
+			WRITE(*,*) 'I =',I
+			WRITE(*,*) 'ISURF=',ISURF
+			WRITE(*,*) 'CYCLE=',NCYCLE
+			WRITE(*,*) 'HG =',HG
+			STOP
+		END IF
+		VFLAG = VOLF(I)
+		IF (I .EQ. ISURF) VFLAG = 0.0D+00
+		CALL CONDVST(T(I),VFLAG,COND)
+		CALL HEATCAP(VOLF(I),T(I),HG(I),CV)
+		ALPHA = COND / (RHO(I) * CV)
+		DXHEAT = X(I) - X(I-1)
+		DTI = CFL * DXHEAT**2 / ALPHA
+		IF (DTI .LT. DTHEAT) THEN
+			DTHEAT = DTI
+		END IF
+70	CONTINUE
+
+//  LIMIT TIME STEP IF MAX TEMP CHANGE IN LAST TIME STEP WAS TOO BIG
+	TEMPBIG = 200
+	IF (DTEMPMAX .GT. TEMPBIG) THEN
+		DTTEMP = DT * TEMPBIG / DTEMPMAX
+	ELSE
+		DTTEMP = 100.0
+	END IF
+
+//  SET NEXT TIME STEP FROM HYDRO AND THERMAL CONSTRAINTS
+	DTOLD = DT
+	DT = MIN(DTHEAT,DTHYDRO,CT2*DT,DTVAP,DTTEMP)
+	IF (LHYDRO .NE. 1) DT = DTHEAT
+	IF (DT .GT. DTMAX) DTMAX = DT
+	IF (DT .LT. DTMIN) THEN
+		DTMIN = DT
+	END IF
+
+//  TIME STEP DIAGNOSTIC SECTION
+	IF (DT .LT. 1.0D-17) THEN
+		WRITE(*,153) DT,DTHEAT,DTHYDRO,DTVAP,DTTEMP,DTEMPMAX
+// 		WRITE(*,*) ITEMPMAX,T(ITEMPMAX),ABS(T(ITEMPMAX) - TNEW(ITEMPMAX))
+	END IF
+
+//  COMPUTE NUCLEATION RATE (LOG10(J) = RATEJ)
+	DO 87, K=1,N
+		IF (K .GT. ISURF .AND. T(K) .GT. TMELT) THEN
+			CALL NUCLEATE(T(K),RHO(K),P(K),RAWJ,RAWTNUC)
+
+			RATEJ(K) = DLOG10(RAWJ)
+			TNUC(K) = DLOG10(RAWTNUC)
+			RAWBUB = 10**BUBBLE(K) + RAWJ*DT
+			BUBBLE(K) = DLOG10(RAWBUB)
+
+//  TEST VARIOUS MAXIMUM THRESHOLD DEPTHS
+			IF (RATEJ(K) .GT. 35. .AND. K .GT. I35) THEN
+				I35 = K
+				X35 = XLOC(K)
+			END IF
+			IF (RATEJ(K) .GT. 30. .AND. K .GT. I30) THEN
+				I30 = K
+				X30 = XLOC(K)
+			END IF
+			IF (RATEJ(K) .GT. 25. .AND. K .GT. I25) THEN
+				I25 = K
+				X25 = XLOC(K)
+			END IF
+			IF (RATEJ(K) .GT. 20. .AND. K .GT. I20) THEN
+				I20 = K
+				X20 = XLOC(K)
+			END IF
+			IF (BUBBLE(K) .GT. 27. .AND. K .GT. IB27) THEN
+				IB27 = K
+				XB27 = XLOC(K)
+			END IF
+			IF (BUBBLE(K) .GT. 26. .AND. K .GT. IB26) THEN
+				IB26 = K
+				XB26 = XLOC(K)
+			END IF
+			IF (BUBBLE(K) .GT. 25. .AND. K .GT. IB25) THEN
+				IB25 = K
+				XB25 = XLOC(K)
+			END IF
+			IF (BUBBLE(K) .GT. 24. .AND. K .GT. IB24) THEN
+				IB24 = K
+				XB24 = XLOC(K)
+			END IF
+		ELSE
+			RATEJ(K) = -99.
+		END IF
+87	CONTINUE
+
+//  WRITE PRESSURE AND STUFF TO FILES EVERY DTPRESS NANOSECONDS
+	TNS = TM * 1.0D+09
+	
+//  WRITE THE PULSE ENERGY TO FILE
+	DTPRESSEIN=1E-5
+	IF (TSQ .GT. 0.0) THEN
+		TPULSE = TSQ + 0.04 * TSQ
+	ELSE IF (FWHM .GT. 0.0) THEN
+		TPULSE = FWHM * 3
+	END IF
+	IF (TNS .LE. TPULSE) THEN
+		IF (TNS .GT. TPRESSEIN) THEN
+			WRITE(32,159) TNS,TAB,EINDT*(DTPRESSEIN/(DTOLD*1.0D+09))/10000.0
+			TPRESSEIN=TPRESSEIN+DTPRESSEIN
+		END IF
+	END IF
+
+	IF (TNS .LT. 0.001) THEN
+		DTPRESS = 1E-4
+	ELSE IF (TNS .LT. 0.01) THEN
+		DTPRESS = 5E-4
+// 	ELSE IF (TNS .LT. 0.1) THEN
+// 		DTPRESS = 5E-3
+	ELSE IF (TNS .LT. 0.5) THEN
+		DTPRESS = 1E-3
+	ELSE IF (TNS .LT. 1.0) THEN
+		DTPRESS = 0.01
+	ELSE IF (TNS .LT. 3.0) THEN
+		DTPRESS = 0.05
+	ELSE IF (TNS .LT. 20.0) THEN
+		DTPRESS = 0.5
+	ELSE
+		DTPRESS = 5.0
+	END IF
+	
+	IF (TNS .GT. TPRESS) THEN
+		WRITE(11,105) TNS,(TAB,P(K),K=1,N)
+		WRITE(13,105) TNS,(TAB,SX(K),K=1,N)
+		WRITE(14,105) TNS,(TAB,SXD(K),K=1,N)
+		WRITE(27,105) TNS,(TAB,Q(K),K=1,N)
+		WRITE(26,145) TNS,(TAB,A(K),K=0,N)
+		WRITE(15,145) TNS,(TAB,U(K),K=0,N)
+		WRITE(16,145) TNS,(TAB,XNEW(K),K=0,N)
+		WRITE(17,105) TNS,(TAB,RHONEW(K),K=1,N)
+		WRITE(18,105) TNS,(TAB,XQUAL(K),K=1,N)
+		WRITE(19,105) TNS,(TAB,T(K),K=1,N)
+		WRITE(20,105) TNS,(TAB,HG(K),K=1,N)
+		WRITE(22,105) TNS,(TAB,VOLF(K),K=1,N)
+		WRITE(24,105) TNS,(TAB,TNUC(K),K=1,N)
+		WRITE(25,105) TNS,(TAB,RATEJ(K),K=1,N)
+		WRITE(35,105) TNS,(TAB,BUBBLE(K),K=1,N)
+		WRITE(28,110) TNS,(TAB,PLASTIC(K),K=1,N)
+		WRITE(37,105) TNS,(TAB,HINP(K)/10000.0,K=1,N)
+		WRITE(38,105) TNS,(TAB,HCONDP(K)/10000.0,K=1,N)
+		WRITE(39,105) TNS,(TAB,HDEVP(K)/10000.0,K=1,N)
+		WRITE(40,105) TNS,(TAB,HSTRESSP(K)/10000.0,K=1,N)
+		WRITE(41,105) TNS,(TAB,F1P(K),K=1,N)
+		WRITE(42,105) TNS,(TAB,F2P(K),K=1,N)
+		WRITE(43,105) TNS,(TAB,ZMASS(K)/6*(U(K)**2+U(K-1)**2
+     &		+ U(K)*U(K-1)),K=1,N)
+		WRITE(44,105) TNS,(TAB,(1/6)*ZMASS(K)*(U(K)**2
+     &		 + U(K)*U(K-1) + U(K-1)**2) ,K=1,N)
+
+//  3RD AND 2ND T DERIVATIVE RATIO FOR DIAGNOSTICS
+		DX = X(I) - X(I-1)
+		RELDTLIMIT = 0.001
+//  FIRST DERIVATIVE
+		DO I=2,N-1
+			TMV = (T(I+1) + T(I-1)) / 2
+			IF (ABS((T(I+1)-T(I-1)) / TMV) .GT. RELDTLIMIT) THEN
+				TP(I) = (T(I+1) - T(I-1)) / (2 * DX)
+			ELSE
+				TP(I) = 0.0
+			END IF
+		END DO
+		TMV = (T(2) + T(1)) / 2
+		IF (ABS((T(2)-T(1)) / TMV) .GT. RELDTLIMIT) THEN
+			TP(1) = (T(2) - T(1)) / DX
+		ELSE
+			TP(1) = 0.0
+		END IF
+		TMV = (T(N) + T(N-1)) / 2
+		IF (ABS((T(N)-T(N-1)) / TMV) .GT. RELDTLIMIT) THEN
+			TP(N) = (T(N) - T(N-1)) / DX
+		ELSE
+			TP(N) = 0.0
+		END IF
+
+//  SECOND DERIVATIVE
+		DO I=2,N-1
+			TPP(I) = (TP(I+1) - TP(I-1)) / (2 * DX)
+		END DO
+		TMV = (T(2) + T(1)) / 2
+		IF (ABS((T(2)-T(1)) / TMV) .GT. RELDTLIMIT) THEN
+			TPP(1) = (T(2) - T(1)) / DX**2
+		ELSE 
+			TPP(1) = 0.0
+		END IF
+		TMV = (T(N) + T(N-1)) / 2
+		IF (ABS((T(N)-T(N-1)) / TMV) .GT. RELDTLIMIT) THEN
+			TPP(N) = (-T(N) + T(N-1)) / DX**2
+		ELSE 
+			TPP(N) = 0.0
+		END IF
+
+//  THIRD DERIVATIVE
+		DO I=2,N-1
+			TPPP(I) = (TPP(I+1) - TPP(I-1)) / (2 * DX)
+		END DO
+		TPPP(1) = TPP(1) / DX
+		TPPP(N) = -TPP(N) / DX
+
+//  RATIO
+		DO I=1,N
+			IF (ABS(TPP(I)) .GT. 0) THEN
+				RATIO(I) = ABS((TPPP(I) * DX) / (2 * TPP(I)))
+			ELSE 
+				RATIO(I) = 0.0
+			END IF
+		END DO
+		WRITE(29,105) TNS,(TAB,RATIO(K),K=1,N)
+		WRITE(33,105) TNS,(TAB,TP(K),K=1,N)
+		WRITE(30,105) TNS,(TAB,(2 * TPP(K)),K=1,N)
+		WRITE(31,105) TNS,(TAB,(TPPP(K) * DX),K=1,N)
+
+//  ENERGY BALANCE
+//  SUM FOR DIFFERENT TYPES + INPUT ENERGY
+//  FOR VAPORS
+		HINSUM = 0.0
+		HCONDSUM = 0.0
+		HDEVSUM = 0.0
+		HSTRESSSUM = 0.0
+		EKIN = 0.0
+		DO I=1,ISURFEND
+			HINSUM = HINSUM + HINP(I)
+			HCONDSUM = HCONDSUM + HCONDP(I)
+			HDEVSUM = HDEVSUM + HDEVP(I)
+			HSTRESSSUM = HSTRESSSUM + HSTRESSP(I)
+			UBAR = (U(K)**2 + U(K)*U(K-1) + U(K-1)**2)/6
+			EKIN = EKIN + ZMASS(I) * UBAR
+		END DO
+		WRITE(47,161) TNS,TAB,HINSUM/10000.0,TAB,HCONDSUM/10000.0,TAB,
+     &			HDEVSUM/10000.0,TAB,HSTRESSSUM/10000.0,TAB,EKIN/10000.0
+//  FOR SOLID/LIQUID
+		HINSUM = 0.0
+		HCONDSUM = 0.0
+		HDEVSUM = 0.0
+		HSTRESSSUM = 0.0
+		EKIN = 0.0
+		DO I=ISURFEND+1,N
+			HINSUM = HINSUM + HINP(I)
+			HCONDSUM = HCONDSUM + HCONDP(I)
+			HDEVSUM = HDEVSUM + HDEVP(I)
+			HSTRESSSUM = HSTRESSSUM + HSTRESSP(I)
+			UBAR = (U(K)**2 + U(K)*U(K-1) + U(K-1)**2)/6
+			EKIN = EKIN + ZMASS(I) * UBAR		
+		END DO
+		WRITE(48,161) TNS,TAB,HINSUM/10000.0,TAB,HCONDSUM/10000.0,TAB,
+     &			HDEVSUM/10000.0,TAB,HSTRESSSUM/10000.0,TAB,EKIN/10000.0
+//  VAPOR + SOLID/LIQUID
+		HINSUM = 0.0
+		HCONDSUM = 0.0
+		HDEVSUM = 0.0
+		HSTRESSSUM = 0.0
+		EKIN = 0.0
+		DO I=1,N
+			HINSUM = HINSUM + HINP(I)
+			HCONDSUM = HCONDSUM + HCONDP(I)
+			HDEVSUM = HDEVSUM + HDEVP(I)
+			HSTRESSSUM = HSTRESSSUM + HSTRESSP(I)
+			UBAR = (U(K)**2 + U(K)*U(K-1) + U(K-1)**2)/6
+			EKIN = EKIN + ZMASS(I) * UBAR
+		END DO
+		WRITE(34,161) TNS,TAB,HINSUM/10000.0,TAB,HCONDSUM/10000.0,TAB,
+     &			HDEVSUM/10000.0,TAB,HSTRESSSUM/10000.0,TAB,EKIN/10000.0
+
+
+//  SUM OF ALL TYPES + INPUT ENERGY
+//  FOR VAPORS
+		ESUM = 0.0
+		DO I=1,ISURFEND
+			UBAR = (U(I) + EKINSIGN*U(I-1)) / 2.
+			EKIN = 0.5 * ZMASS(I) * UBAR**2
+			ESUM = ESUM + H(I) - HSTRESSP(I)
+		END DO
+		WRITE(45,160) TNS,TAB,EINMAXVAP/10000.0,TAB,ESUM/10000.0
+//  FOR SOLID/LIQUID
+		ESUM = 0.0
+		DO I=ISURFEND+1,N
+			UBAR = (U(I) + EKINSIGN*U(I-1)) / 2.
+			EKIN = 0.5 * ZMASS(I) * UBAR**2
+			ESUM = ESUM + H(I) - HSTRESSP(I)
+		END DO
+		WRITE(46,160) TNS,TAB,EINMAXSL/10000.0,TAB,ESUM/10000.0
+//  VAPOR + SOLID/LIQUID
+		ESUM = 0.0
+		DO I=1,N
+			UBAR = (U(I) + EKINSIGN*U(I-1)) / 2.
+			EKIN = 0.5 * ZMASS(I) * UBAR**2
+			ESUM = ESUM + H(I) - HSTRESSP(I)
+		END DO
+		WRITE(36,160) TNS,TAB,EINMAX/10000.0,TAB,ESUM/10000.0
+
+//  CHECK THE MOMENTUM CONSERVATION
+		MOMSUM = 0.0
+		DO I=1,N
+			MOMSUM = MOMSUM + (U(I)+U(I-1)/2) * ZMASS(I)
+		END DO
+		WRITE(49,159) TNS,TAB,MOMSUM
+
+		TPRESS = TPRESS + DTPRESS
+	END IF
+
+//  WRITE SOME INFO TO SCREEN EVERY FEW NS
+	DTSCREEN = 2.
+	IF (TNS .GT. 50.) DTSCREEN = 10.
+	IF (TNS .GT. TSCREEN) THEN
+		K1 = ISURF
+		K2 = ISURF + 4
+		WRITE(*,137) TNS, DT, (T(K),K=K1,K2), XMELT
+		TSCREEN = TSCREEN + DTSCREEN
+	END IF
+
+	GOTO 20
+
+//  *****************************************************************
+//  TIME LIMIT HAS BEEN REACHED
+95	CONTINUE
+	
+	CLOSE(10)
+	CLOSE(11)
+	CLOSE(13)
+	CLOSE(14)
+	CLOSE(15)
+	CLOSE(16)
+	CLOSE(17)
+	CLOSE(26)
+	CLOSE(27)
+	CLOSE(18)
+	CLOSE(19)
+	CLOSE(20)
+	CLOSE(21)
+	CLOSE(22)
+	CLOSE(25)
+	CLOSE(35)
+	CLOSE(28)
+	CLOSE(29)
+	CLOSE(30)
+	CLOSE(31)
+	CLOSE(32)
+	CLOSE(33)
+	CLOSE(34)
+	CLOSE(36)
+	CLOSE(37)
+	CLOSE(38)
+	CLOSE(39)
+	CLOSE(40)
+	CLOSE(41)
+	CLOSE(42)
+	CLOSE(43)
+	CLOSE(44)
+	CLOSE(45)
+	CLOSE(46)
+	CLOSE(47)
+	CLOSE(48)
+	CLOSE(49)
+
+	X0M1 = X0(ISURF-1)
+	VAPDEPTH = 1.0D+06*(X0M1+XQUAL(ISURF)*(X0(ISURF)-X0M1))
+	OPEN(UNIT=23,FILE='summary')
+	EINMAX = EINMAX / 10000.
+	WRITE(*,112) EINMAX
+	WRITE(*,113) XMELTMAX
+	WRITE(*,119) XTMELTMAX
+	WRITE(*,120) X0(ISPALL) * 1.0D+06
+	WRITE(*,114) TFMAX
+	WRITE(*,115) HGFMAX / 4184.
+	WRITE(*,117) DTMIN, DTMAX
+	WRITE(*,118) DHGMXMAX / 4184.
+	WRITE(*,122) HEASTMAX / 10000.
+	WRITE(*,135) XQUAL(ISURF)
+	WRITE(*,136) ESUM/10000., EINMAX
+	WRITE(*,148) VAPDEPTH
+	WRITE(*,157) X35,X30,X25,X20
+	WRITE(*,158) XB27,XB26,XB25,XB24
+	IF (PLASTICFLAG	.EQ. 1) THEN 
+		WRITE(*,*) 'Plastic deformation has occured!'
+	END IF
+
+	WRITE(23,112) EINMAX
+	WRITE(23,113) XMELTMAX
+	WRITE(23,119) XTMELTMAX
+	WRITE(23,120) X0(ISPALL) * 1.0D+06
+	WRITE(23,114) TFMAX
+	WRITE(23,115) HGFMAX / 4184.
+	WRITE(23,117) DTMIN, DTMAX
+	WRITE(23,118) DHGMXMAX / 4184.
+	WRITE(23,122) HEASTMAX / 10000.
+	WRITE(23,135) XQUAL(ISURF)
+	WRITE(23,136) ESUM/10000., EINMAX
+	WRITE(23,148) VAPDEPTH
+	WRITE(23,157) X35,X30,X25,X20
+	WRITE(23,158) XB27,XB26,XB25,XB24
+	IF (PLASTICFLAG	.EQ. 1) THEN 
+		WRITE(23,*) 'Plastic deformation has occured!'
+	END IF
+	
+	CLOSE(23)
+	
+99	CONTINUE
+
+999	FORMAT(2(' ',E13.6))
+101	FORMAT(D13.6,2(A1,D13.6))
+102	FORMAT('TIME =',2F12.3)
+103	FORMAT(F10.5,A1,F10.2,A1,F12.3,A1,F12.4)
+104	FORMAT('TIME =',F12.5)
+105	FORMAT(F10.5,400(A1,E12.5E3))
+106	FORMAT(F10.5,F10.2,F10.3)
+107	FORMAT(F12.5,F12.3,F12.5)
+108	FORMAT(F12.3,35(A1,F12.5))
+109	FORMAT(4E12.4)
+110	FORMAT(F10.5,400(A1,I1))
+111	FORMAT(I5,F10.4,E14.5)
+112	FORMAT('Total fluence (J/cm2) =',F12.3)
+113	FORMAT('Maximum melt depth (micron) =',F12.3)
+114	FORMAT('Maximum front surface temp =',F12.2)
+115	FORMAT('Maximum front surface enthalpy (cal/g) =',F12.4)
+117	FORMAT('Minimum and maximum time steps =',2(1PE12.3))
+118	FORMAT('Maximum enthalpy change (cal/g) =',F12.4)
+119	FORMAT('Maximum total melt depth (micron) =',F12.3)
+120	FORMAT('Spalled depth (micron) =',F12.3)
+122	FORMAT('Maximum heat flux (W/cm2) =',1PE12.4)
+130	FORMAT(A)
+131	FORMAT(D12.4)
+133	FORMAT(D13.6,2(A3,D15.6))
+134	FORMAT(F10.4,A1,I5,A1,F10.4)
+135	FORMAT('Fraction vaporized in surface zone',F10.5)
+136	FORMAT('Energy present & input (J/cm2) =',2F12.3)
+137	FORMAT(F11.3,E11.3,6F11.3)
+138	FORMAT(I8,F8.3,2E12.3,F12.5,I5)
+139	FORMAT(A7,5(1PE12.5))
+141	FORMAT(F12.4,5(A1,1PE12.4))
+145	FORMAT(F10.5,401(A1,E12.5E3))
+146	FORMAT(F10.5,A1,I5,2(A1,F12.5))
+147	FORMAT(F12.7,4(A1,1PE12.5))
+148	FORMAT('Vaporized depth (micron) =',F12.3)
+149	FORMAT(F12.7,5(A1,1PE12.5))
+153	FORMAT('low DT ',6E12.4)
+154	FORMAT(F12.7,A1,1PE12.5)
+155	FORMAT(F12.7,A1,I5,3(A1,E12.5))
+157	FORMAT('J-depths (35,30,25,20) =',4F10.3)
+158	FORMAT('Bubble-depths (27,26,25,24) =',4F10.3)
+159	FORMAT(F10.5,A1,E11.5)
+160	FORMAT(F10.5,2(A1,F10.6))
+161	FORMAT(F10.5,5(A1,F10.6))
+	
+	STOP
+	END
+//  THIS IS THE END OF ABLATOR ROUTINE
+}
+
+//  **********************************************************
+//  READ IN MATERIAL PROPERTY DATA
+//  UNITS INPUT AS CONVENIENT, BUT CONVERT TO SI IN THIS SUBROUTINE
+void READMAT()
+{
+  ifstream ifs("matdata");
+  MATNAME = FortranIO::read_string(ifs);
+  cout << MATNAME << endl;
+  FortranIO::skip_line(ifs);
+  //  DENSITY IN kg/m**3
+  s_eosdat.RHO0 = FortranIO::read_double(ifs);
+  FortranIO::skip_line(ifs);
+  //  MELT TEMPERATURE IN K
+  s_matdat.TMELT = FortranIO::read_double(ifs);
+  FortranIO::skip_line(ifs);
+  //  CURVE FIT COEFFICIENT FOR THERMAL COND VS TEMP
+  //  FIFTH-ORDER POLYNOMIALS FOR SOLID AND LIQUID
+  //  AND ONE PARAMETER FOR VAPOR
+  //  UNITS: cal/m.s.K and K
+  for(int i=0;i<6;i++){
+    ACOND[i] = FortranIO::read_double(ifs);
+  }
+  FortranIO::skip_line(ifs);
+  for(int i=6;i<12,i++)
+  {
+    ACOND[i] = FortranIO::read_double(ifs);
+  }
+  FortranIO::skip_line(ifs);
+  ACOND[12] = FortranIO::read_double(ifs);
+  //  CONVERT TO SI UNITS (W/m.K)
+  for(int i=0;i<13;i++)
+  {
+    ACOND[i] *= 4.184
+  }
+  //  CURVE FIT COEFFICIENTS FOR TEMPERATURE VS ENTHALPY
+  //  FIRST 6 FOR SOLID, THEN 2 EACH FOR LIQUID AND VAPOR
+  //  UNITS: K and cal/g
+  FortranIO::skip_line(ifs);
+  for(int i=0i<6;i++)
+  {
+    AH2T[i] = FortranIO::read_double(ifs);
+  }
+  FortranIO::skip_line(ifs);
+  for(int i=6i<8;i++)
+  {
+    AH2T[i] = FortranIO::read_double(ifs);;
+  }
+  FortranIO::skip_line(ifs);
+  for(int i=8;i<10;i++)
+  {
+    AH2T[i] = FortranIO::read_double(ifs);
+  }
+  //  CONVERT TO SI UNITS (J/kg)
+  for(int i=1;<6;i++)
+  {
+    AH2T[i] = AH2T[i] / pow(4184.0,i);
+  }
+  AH2T[7] /= 4184.0;
+  AH2T[9] /= 4184.0;
+  //  Tboil vs. P COEFFICIENTS
+  //  FROM DUSHMAN: LOG(P) = A - B/T
+  //  UNITS: P in microns, T in K
+  FortranIO::skip_line(ifs);
+  s_eosdat.ABOIL = FortranIO::read_double(ifs);
+  s_eosdat.BBOIL = FortranIO::read_double(ifs);
+  //  CONVERT TO SI UNITS (Pa)
+  s_eosdat.ABOIL -= log10(7.5);
+  //  EQUATION OF STATE COEFFICIENTS
+  FortranIO::skip_line(ifs);
+  for(int i=0;i<10;i++)
+  {
+    EOSCOEF[i] = FortranIO::read_double(ifs);
+  }
+  //  POISSON'S RATIO
+  FortranIO::skip_line(ifs);
+  s_eosdat.PRNU = FortranIO::read_double(ifs);
+  //  YIELD STRENGTH
+  FortranIO::skip_line(ifs);
+  for(int i=0;i<3;i++)
+  {
+    YIELDCOEF[i] = FortranIO::read_double(ifs);
+  }
+  //  SURFACE TENSION PARAMETERS
+  FortranIO::skip_line(ifs);
+  for(int i=0;i<7;i++)
+  {
+    SIGMACOEF[i] = FortranIO::read_double(ifs);
+  }
+  ifs.close();
+  
+  //  COMPUTE ETHALPIES FOR INCIPIENT ANT TOTAL MELT
+  //  START BY ASSUMING A LINEAR FIT FOR LIQUID T VS. H
+  //  UNITS ARE: J/kg and K
+  s_matdat.HMELTT = (s_matdat.TMELT - AH2T[6]) / AH2T[7];
+  //  NOW GET INCIPIENT MELT ENERGY VIA NEWTON'S METHOD
+  double hm = 0.6 * _matdat.HMELTT;
+  double ah2tzero = AH2T[6] - s_matdat.TMELT;
+  for(int i=0i<6;i++)
+  {
+    hm -= (ah2tzero + hm*(AH2T[1] + hm*AH2T[2] + hm*(AH2T[3] + 
+	  (hm*(AH2T[4] + hm*AH2T[5]))))) /
+	  (AH2T[1] + hm*(2.0*AH2T[2] + hm*(3.0*AH2T[3] + hm*(4.0*AH2T[4] +
+          hm*5.0*AH2T[5]))));
+  }
+  s_matdat.HMELTI = hm;
+  cout << 'H-MELT-I (CAL/G) =' << hm/4184.0 << endl;
+  cout << 'H-MELT-I (CAL/G) =' << s_matdat.HMELTT/4184.0 << endl;
+}
+
+//  **********************************************************
+//  SET ZONE EDGE LOCATIONS, ZONE CENTERS AND ZONE MASSES
+//  GEOM IS FLAG FOR PLANAR (1), CYLINDRICAL (2) OR SPHERICAL (3)
+void ZONESET(double& rho0,double x0[], double xc[], double xloc[],double zmass[],int& geom, ifstream& file)
+{
+//  PLANAR GEOMETRY
+  geom = 1;
+//  FIRST ZONE GRID SIZE DX METERS
+// 	DX = 5E-10
+  FortranIO::skip_line(file);
+  
+  double dx = FortranIO::read_double(file);
+  dx *= 1e-9;
+  double ratio = 1.02;
+//  THEESE PARAMETERS GIVE TOTAL X = 56 MICRONS FOR 100 ZONES
+//  ZONE MASS IN kg/m2
+//  ZONE LOCATIONS IN meters
+//  INITIAL ZONE CENTER LOCATIONS IN XLOC ARRAY IN microns
+  x0[0] = 0.0;
+  for(int i=1;i<NP1;i++){
+    x0[i] = x0[0] + dx * (pow(ratio,i) - 1.0) / (ratio-1.0);
+    DENGEOM(geom,x0[i-1],x0[i],RDEN);
+    zmass[i] = rho0 * (x0[i] + x0[i-1]) * RDEN;
+    xc[i] = (x0[i] + x0[i-1]) / 2.0;
+    xloc[i] = xc[i] * 1.0e6;
+  }
+  //???
+130	FORMAT(A)
+}
+
+//  **********************************************************
+//  RETURN GEOMETRY FACTOR TO GET CORRECT ZONE MASSES
+	SUBROUTINE DENGEOM(GEOM,R1,R2,RDEN)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	INTEGER GEOM
+
+	PI = 4.0 * ATAN(1.)
+	IF (GEOM .EQ. 1) THEN
+		RDEN = 1.0D+00
+	ELSE IF (GEOM .EQ. 2) THEN
+		RDEN = PI * (R1 + R2)
+	ELSE 
+		RDEN = (4./3.) * PI * (R1**2 + R1*R2 + R2**2)
+	END IF
+	
+	RETURN
+	END
+
+//  **********************************************************
+//  RETURN GEOMETRY FACTOR TO GET CORRECT HEAT CONDUCTION
+//  Q = BETAC * K * DT / DX
+//  FOR W/m2 planar, W/m cylindrical and W spherical
+	SUBROUTINE BETAGEOM(GEOM,R1,R2,BETAC)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	INTEGER GEOM
+
+	PI = 4.0 * ATAN(1.)
+	
+	IF (GEOM .EQ. 1) THEN
+		BETAC = 1.0D+00
+	ELSE IF (GEOM .EQ. 2) THEN
+		BETAC = PI * (R1 + R2)
+	ELSE
+		BETAC = PI * (R1 + R2)**2
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  RETURN AREA AT A GIVEN RADIUS DEPENDING ON GEOMETRY
+	SUBROUTINE AREAGEOM(GEOM,R,AREA)	
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	INTEGER GEOM
+
+	PI = 4.0 * ATAN(1.)
+	
+	IF (GEOM .EQ. 1) THEN
+		AREA = 1.0D+00
+	ELSE IF (GEOM .EQ. 2) THEN
+		AREA = 2.0D+00 * PI * R
+	ELSE
+		AREA = 4.0D+00 * PI * R**2
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  FIND NEW TIME STEP SIZE TO HAVE X0 POINT JUST HIT AXIS
+//  FOR CYLINDRICAL AND SPHERICAL GEOMETRIES
+//  ** CAUTION!! UNTESTED ROUTINE **
+	SUBROUTINE AXIS(X0,U0,A0,DTOLD,DTNEW)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+
+	A = A0 / 2.0
+	B = U0 + A0 *DTOLD / 2.0
+	C = X0
+	B24AC = B**2 - 4*A*C
+	IF (B24AC .LT. 0) THEN
+		WRITE(*,*) 'ERROR IN AXIS ROUTINE'
+		STOP
+	END IF
+	DTP = (-B + SQRT(B24AC)) / (2.*A)
+	DTM = (-B - SQRT(B24AC)) / (2.*A)
+
+//  CHOOSE NEW TIME STEP AS SMALLEST POSITIVE ROOT
+	IF (DTM .LE. 0.0) THEN
+		IF (DTP .GT. 0) THEN
+			DTNEW = DTP
+		ELSE
+			WRITE(*,*) 'ERROR IN AXIS ROUTINE'
+			STOP
+		END IF
+	ELSE
+		DTMIN = DTM
+	END IF
+	
+	RETURN
+	END
+
+//  **********************************************************
+//  SET UP FOR ENERGY DEPOSITION BASED ON ISOURCE CHOICE
+	SUBROUTINE XSOURCE(ISOURCE,LASERFLAG,FBBLEAK,TSTART)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	PARAMETER(NBIN=45)
+	DIMENSION BIN(NBIN),BINW(NBIN),FBBLEAK(NBIN)
+
+	COMMON/PULSE/TSQ,ESQ,EGAUSS,SC,FWHM
+	COMMON/OPACBINS/BIN,BINW
+	
+//  DEFINE A BLACKBODY FUNCTION
+	BBE(JBB,TBB) = BINW(JBB) * ((BIN(JBB)/TBB)**3) / 
+     &		(EXP(BIN(JBB)/TBB)-1.)
+
+	IF (ISOURCE .EQ. 1) THEN
+// 		WRITE(*,*) 'Enter pulse duration (ns)'
+// 		READ(*,*) TSQ
+		READ(9,130) COMMENT
+		READ(9,*) TSQ
+// 		WRITE(*,*) 'Enter total energy in the pulse (J)'
+// 		READ(*,*) ESQ
+		READ(9,130) COMMENT
+		READ(9,*) ESQ
+
+		IF (LASERFLAG .NE. 1) THEN
+// 			WRITE(*,*) 'Enter blackbody temperature (keV)'
+// 			READ(*,*) BBTLEAK
+			READ(9,130) COMMENT
+			READ(9,*) BBTLEAK
+		ELSE
+//  SKIP READING BLACKBODY TEMPERATURE FROM THE FILE
+			READ(9,130) COMMENT
+			READ(9,*) COMMENT
+		END IF
+		
+	ELSE IF (ISOURCE .EQ. 2) THEN
+// 		WRITE(*,*) 'Enter pulse FWHM (ns)'
+// 		READ(*,*) FWHM
+		READ(9,130) COMMENT
+		READ(9,*) FWHM
+// 		WRITE(*,*) 'Enter total energy in the pulse (J)'
+// 		READ(*,*) EGAUSS
+		READ(9,130) COMMENT
+		READ(9,*) EGAUSS
+		IF (LASERFLAG .NE. 1) THEN
+// 			WRITE(*,*) 'Enter blackbody temperature (keV)'
+// 			READ(*,*) BBTLEAK
+			READ(9,130) COMMENT
+			READ(9,*) BBTLEAK
+		ELSE
+//  SKIP READING BLACKBODY TEMPERATURE FROM THE FILE
+			READ(9,130) COMMENT
+			READ(9,130) COMMENT
+		END IF
+		
+		SC = 2. * SQRT(-2. * LOG(0.5)) / FWHM
+	ELSE 
+		WRITE(*,*) 'Invalid source term number entered'
+		STOP
+	END IF
+
+	IF (LASERFLAG .NE. 1) THEN
+//  FRACTION OF BLACKBODY ENERGY IN EACH BIN
+//  ASSUME SQUARE AND GAUSSIAN PULSES ARE PURE LAMBERTIAN
+		SUMLEAK = 0.
+		DO J=1,NBIN
+			FBBLEAK(J) = BBE(J,BBTLEAK)
+			SUMLEAK = SUMLEAK + FBBLEAK(J)
+		END DO
+
+//  NORMALIZE TO MAKE THESE FRACTIONS OF TOTAL ENERGY
+		DO J=1,NBIN
+			FBBLEAK(J) = FBBLEAK(J) / SUMLEAK
+		END DO
+//  FOR LASER USE MONOCHROMATIC SPECTRUM
+	ELSE
+		DO J=1,NBIN
+			FBBLEAK(J) = 0.0
+		END DO
+		FBBLEAK(1) = 1.0
+	END IF
+// 	DO J=1,NBIN
+// 		WRITE(*,*) FBBLEAK(J)
+// 	ENDDO
+
+//  SET PROBLEM START TIME, TSTART IN ns
+	TSTART = 0.0
+
+130	FORMAT(A)
+	RETURN
+	END
+
+//  **********************************************************
+//  SET MAGNITUDE OF ENERGY PULSES
+//  RETURNS ENERGY IN EACH BIN FOR THIS TIME STEP
+	SUBROUTINE XPULSE(TM,ISOURCE,AREA,FBBLEAK)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	PARAMETER(NBIN=45)
+	DIMENSION ELEAK(NBIN),EIN(NBIN),ELEAKOLD(NBIN)
+	DIMENSION BIN(NBIN),BINW(NBIN),FBBLEAK(NBIN)
+
+	COMMON/PULSE/TSQ,ESQ,EGAUSS,SC,FWHM
+	COMMON/EINTEGRAL/ELEAKOLD,ELEAK,EIN
+	COMMON/OPACBINS/BIN,BINW
+
+	EXTERNAL ERF
+
+	TNS = TM * 1.0D+09
+
+	IF (ISOURCE .EQ. 1) THEN
+//  SQUARE PULSE, STARTS AT TIME = 0
+//  USE 2% RAMP AT START AND END
+		TRAMP = TSQ * 0.02
+		IF (TNS .LT. TRAMP) THEN
+			FTMLEAK = ESQ * TNS**2 / (2. * TSQ * TRAMP)
+		ELSE IF (TNS .LT. TSQ) THEN
+			FTMLEAK = ESQ * (TNS-TRAMP/2.) / TSQ
+		ELSE IF (TNS .LT. (TSQ+TRAMP)) THEN
+			TAU = TNS - TSQ
+			FTMLEAK = (ESQ/TSQ)*(TSQ-TRAMP/2.+TAU-TAU**2 / (2.*TRAMP))
+		ELSE
+			FTMLEAK = ESQ
+		END IF
+
+	ELSE
+//  GAUSSIAN PULSE
+		TSTAR = (TNS - 1.5 * FWHM) * SC / SQRT(2.)
+		WRITE(*,*) TNS,SC,TSTAR
+		A1 = 0.278393
+		A2 = 0.230389
+		A3 = 0.000972
+		A4 = 0.078108
+		XIN = TSTAR
+		XG = DABS(XIN)
+		WRITE(*,*) XG
+// 		IF (XIN .GE. 0) THEN
+			MYERF = DABS(1. - 1. / (1. + XG * (A1 + XG * 
+     &				(A2 + XG * (A3 + XG * A4))))**4)
+// 		ELSE
+// 			MYERF = -1
+// 		END IF
+		WRITE(*,*) 'MYERF(TSTAR) = ',MYERF,'(',XIN,')'
+		FTMLEAK = 0.5 * (0. + MYERF) * EGAUSS
+		WRITE(*,*) 'FTMLEAK = ',FTMLEAK
+	END IF
+
+//  SET UP INCIDENT ENERGY IN EACH BIN IN THIS TIME STEP
+//  EIN(J) IS IN J/m2; ELEAK ARE IN JOULES
+	DO 33, J=1,NBIN
+		ELEAK(J) = FBBLEAK(J) * FTMLEAK
+		ELNET = ELEAK(J) - ELEAKOLD(J)
+		EIN(J) = ELNET / AREA
+		ELEAKOLD(J) = ELEAK(J)
+// 		WRITE(*,*) J,EIN(J),FTMLEAK
+33	CONTINUE
+
+	RETURN
+	END
+
+//  **********************************************************
+//  DEFINE THERMAL CONDUCTIVITY VS TEMPERATURE
+//  USE UP TO A FIFTH-ORDER POLYNOMIAL
+//  UNITS ARE: W/m.K and K IN CURVE FITS
+	SUBROUTINE CONDVST(T,VOLF,COND)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION AS(0:5), AL(0:5), AH2T(10)
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,AS,AL,AV,AH2T
+
+	IF (T .LT. 0.0) THEN
+		WRITE(*,*) 'T =',T
+		STOP
+	END IF
+	
+	CONDS = AS(0) + T*(AS(1) + T*(AS(2) + T*(AS(3) + 
+     &		T*(AS(4) + T*AS(5)))))
+	CONDL = AL(0) + T*(AL(1) + T*(AL(2) + T*(AL(3) + 
+     &		T*(AL(4) + T*AL(5)))))
+
+//  MONOATOMIC GAS CONDUCTIVITY
+	CONDV = AV * SQRT(T)
+
+	IF (VOLF .LE. 1.0D-01) THEN
+		IF (T .LT. (TMELT-.1)) THEN
+			COND = CONDS
+		ELSE IF (T .GT. (TMELT+.1)) THEN
+			COND = CONDL
+		ELSE
+//  TWO PHASE LIQUID/SOLID REQION
+			COND = 2. * CONDS * CONDL / (CONDS + CONDL)
+		END IF
+	ELSE IF (VOLF .GE. 0.99) THEN
+		COND = CONDV
+	ELSE
+//  TWO PHASE LIQUID/VAPOR REGION
+		COND = CONDV
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  CONVERT ENTHALPY TO A TEMPERATURE
+//  FOR BOTH SOLID AND LIQUID
+//  USE UP TO A FIFTH-ORDER POLYNOMIALS
+//  UNITS ARE: J/kg and K IN CURVE FITS
+	SUBROUTINE H2T(HJKG,T)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13), AS(0:5)
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AS,AL0,AL1,AV0,AV1
+
+	H = HJKG
+	TS = AS(0) + H*(AS(1) + H*(AS(2) + H*(AS(3) + 
+     &		H*(AS(4) + H*AS(5)))))
+	TL = AL0 + H*AL1
+
+	IF (TL .GT. TMELT) THEN
+		T = TL
+	ELSE IF (TS .LT. TMELT) THEN
+		T = TS
+	ELSE 
+		T = TMELT
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  DETERMINE HEAT CAPACITY (Cv) FOR SOLID, LIQUID AND VAPOR
+//  VAPOR IS BASED ON IDEAL GAS, USSING GAMMA & RBAR
+//  LIQUID AND SOLID USE T vs. ENTHALPY RELATIONS(Cp~Cv)
+//  DECIDE STATE BASED ON VOLUME FRACTION VAPOR (VOLF)
+//  USE UP TO A FIFTH-ORDER POLYNOMIALS
+//  UNITS ARE: J/kg and K IN CURVE FITS
+	SUBROUTINE HEATCAP(VOLF,T,HG,CV)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13), AS(0:5), EOSCOEF(10)
+	DIMENSION YIELDCOEF(3)
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AS,AL0,AL1,AV0,AV1
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	
+	GAMMA = EOSCOEF(9)
+	RBAR = EOSCOEF(10)
+
+	CVVAPOR = RBAR / (GAMMA - 1.0D+00)
+	CVLIQUID = 1.0D+00 / AL1
+	CVSOLID = 1.0D+00 / (AS(1) + HG*(2.*AS(2) + 
+     &		HG*(3.*AS(3) + HG*(4.*AS(4) + HG*5.*AS(5)))))
+	
+	IF (VOLF .GT. 0.999999) THEN
+//  VAPOR
+		CV = CVVAPOR
+	ELSE IF (VOLF .LT. 0.001) THEN
+		IF (T .GT. TMELT) THEN
+//  LIQIUD
+			CV = CVLIQUID
+		ELSE IF (T .LT. TMELT) THEN
+//  SOLID
+			CV = CVSOLID
+		ELSE
+//  TWO-PHASE SOLID/LIQUID
+			CV = MIN(CVLIQUID,CVSOLID)
+		END IF
+	ELSE
+//  TWO-PHASE VAPOR/LIQUID
+		CV = MIN(CVLIQUID,CVVAPOR)
+	END IF
+
+	RETURN
+	END
+
+
+//  **********************************************************
+//  APPROXIMATION TO ERF(X) FROM ABRAMOWITZ & STEGUN
+	DOUBLE PRECISION FUNCTION ERF(XIN)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	
+	A1 = 0.278393
+	A2 = 0.230389
+	A3 = 0.000972
+	A4 = 0.078108
+
+	X = DABS(XIN)
+	IF (XIN .GE. 0) THEN
+		ERF = ABS(1. - 1. / (1. + X * (A1 + X * 
+     &			(A2 + X * (A3 + X * A4))))**4)
+	ELSE
+		ERF = -1
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  COMPUTE EQUATION OF STATE COEFFICIENTS
+//  F1 = F1(RHO) AND F2 = F2(RHO)
+//  FOR LINEAR EOS: PRESSURE = F1 + F2 * ENERGY
+	SUBROUTINE EOSF(RHO,F1,F2)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION EOSCOEF(10), C(0:6)
+	DIMENSION YIELDCOEF(3)
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+
+	U = RHO/RHO0 - 1.0D+00
+//  EOS TYPE
+	ITYPE = NINT(EOSCOEF(1))
+
+	IF (ITYPE .EQ. 1) THEN
+//  STIENBERG'S MODEL (DYNA2D EOS #4)
+		C0 = EOSCOEF(2)
+		S1 = EOSCOEF(3)
+		S2 = EOSCOEF(4)
+		S3 = EOSCOEF(5)
+		G0 = EOSCOEF(6)
+		B = EOSCOEF(7)
+		IF (U .LE. 0.) THEN
+			F1 = RHO0 * C0**2 * U
+		ELSE
+			F1 = RHO0 * C0**2 * U * 
+     &				(1. + (1. - G0/2.) * U + B/2. * U**2) / 
+     &				(1. - (S1-1.)*U - S2*U**2/(U+1.) - S3*U**3/(U+1.)**2)
+		END IF
+		F2 = (G0 + B * U) * RHO
+	ELSE IF (ITYPE .EQ. 2) THEN
+//  LINEAR POLYNOMIAL MODEL (DYNA2D EOS #1 AND #6)
+		DO 20, K=0,6
+			C(K) = EOSCOEF(K+2)
+20		CONTINUE
+		IF (U .LE. 0.) THEN
+			F1 = C(0) + C(1)*U + C(3)*U**3
+			F2 = (C(4) + C(5)*U) * RHO
+		ELSE
+			F1 = C(0) + C(1)*U + C(2)*U**2 + C(3)*U**3
+			F2 = (C(4) + C(5)*U + C(6)*U**2) * RHO
+		END IF
+	ELSE 
+		WRITE(*,*) 'NOT A VALID EOS NUMBER'
+		STOP
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  COMPUTE EQUATION OF STATE COEFFICIENT DERIVATIVES
+//  F1 = F1(RHO) AND F2 = F2(RHO)
+//  FOR LINEAR EOS: PRESSURE = F1 + F2 * ENERGY
+	SUBROUTINE EOSDF(RHO,DF1,DF2)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION EOSCOEF(10), C(0:6),YIELDCOEF(3)
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+
+	U = RHO/RHO0 - 1.0D+00
+//  EOS TYPE
+	ITYPE = NINT(EOSCOEF(1))
+
+	IF (ITYPE .EQ. 1) THEN
+//  STIENBERG'S MODEL (DYNA2D EOS #4)
+		C0 = EOSCOEF(2)
+		S1 = EOSCOEF(3)
+		S2 = EOSCOEF(4)
+		S3 = EOSCOEF(5)
+		G0 = EOSCOEF(6)
+		B = EOSCOEF(7)
+		IF (U .LE. 0.) THEN
+			DF1 = C0**2
+		ELSE
+			XNUMER = C0**2*RHO*(2*RHO**3 + 4.*(1.-G0/2.)*RHO**3*U + 
+     &				3.*B*RHO**3*U**2 - 2.*(1.-G0/2.)*(S1-1.)*RHO**3*U**2 + 
+     &				2.*RHO**2*RHO0*S2*U**2 - 2.*B*(S1-1.)*RHO**3*U**3 - 
+     &				2.*RHO*RHO0**2*S2*U**3 + 4.*RHO*RHO0**2*S3*U**3 - 
+     &				B*RHO**2*RHO0*S2*U**4 - 
+     &				2.*(1-G0/2.)*RHO*RHO0**2*S2*U**4 + 
+     &				2.*(1-G0/2.)*RHO*RHO0**2*S3*U**4 - 
+     &				4.*RHO0**3*S3*U**4 - B*RHO*RHO0**2*S2*U**5 - 
+     &				4.*(1.-G0/2.)*RHO0**3*S3*U**5 - 2.*B*RHO0**3*S3*U**6)
+			XDENOM = 2.*(-RHO**2 + (S1-1.)*RHO**2*U + 
+     &				RHO*RHO0*S2*U**2 + RHO0**2*S3*U**3)**2
+			DF1 = XNUMER / XDENOM
+		END IF
+		DF2 = G0 - B + 2. * B * RHO / RHO0
+
+	ELSE IF (ITYPE .EQ. 2) THEN
+//  LINEAR POLYNOMIAL MODEL (DYNA2D EOS #1 AND #6)
+		DO 20, K=0,6
+			C(K) = EOSCOEF(K+2)
+20		CONTINUE
+		IF (U .LE. 0.) THEN
+			DF1 = (C(1) + 3.*C(3)*U**2) / RHO0
+			DF2 = C(4) - C(5) + 2. * C(5) * RHO / RHO0
+		ELSE
+			DF1 = (C(1) + 2.*C(2)*U + 3.*C(3)*U**2) / RHO0
+			DF2 = C(4) - C(5) + 2.*C(5)*RHO/RHO0 + 
+     &				C(6)*(1.D+00+RHO/RHO0*(-4.D+00+3.*RHO/RHO0))
+		END IF
+	ELSE 
+		WRITE(*,*) 'NOT A VALID EOS NUMBER'
+		STOP
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  COMPUTE EQUATION OF STATE COEFFICIENTS FOR PURE VAPOR
+//  F1 = F1(RHO) AND F2 = F2(RHO)
+//  FOR LINEAR EOS: PRESSURE = F1 + F2 * ENERGY
+//  ASSUMES IDEAL GAS EOS: P = RHO * RBAR * T
+	SUBROUTINE FVAPOR(RHO,F1,F2)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13),AH2T(10),EOSCOEF(10)
+	DIMENSION YIELDCOEF(3)
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+
+	AV0 = AH2T(9)
+	AV1 = AH2T(10)
+	GAMMA = EOSCOEF(9)
+
+	F1 = 0.0
+	F2 = (GAMMA - 1.0D+00) * RHO
+
+	RETURN
+	END
+
+//  **********************************************************
+//  COMPUTE SOUND SPEED IN SOLID/LIQUID
+//  USING DERIVATIVES OF EQUATION OF STATE COEFFICIENTS
+//  F1 = F1(RHO) AND F2 = F2(RHO)
+//  FOR LINEAR EOS: PRESSURE = F1 + F2 * ENERGY
+	SUBROUTINE SOUND(HG,RHO,P,F2,C)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION EOSCOEF(10),YIELDCOEF(3)
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	
+	CALL EOSDF(RHO,DF1,DF2)
+	
+	C = SQRT(DF1 + HG*DF2 + P*F2/RHO**2)
+
+	RETURN
+	END
+
+//  **********************************************************
+//  EQUATION OF STATE COEFFICIENT FOR SPALLED MATERIAL (LIQUID AND/OR VAPOR)
+//  P = F1(RHO) + F2(RHO) * HG
+//  FOR LIQUID PART, USE SOLID (UNSPALLED) EOS
+//  FOR VAPOR PART, USE IDEAL GAS RELATION
+//  BASE TWO-PHASE FITTING ON Tsat vs. Psat CURVE
+//  UNITS: AL,AV COEFFICIENTS IN J/kg, PRESSURE IN Pa
+	SUBROUTINE F2PHASE(RHO,HG,QUAL,F1,F2)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+
+//  CALL EOS ROUTINE TWICE WITH SLIGHTLY DIFFERENT ENERGIES
+	HG1 = HG
+	DELTAHG = HG * 0.01
+	HG2 = HG + DELTAHG
+	CALL EOSPALL(HG1,RHO,T,P1,QUAL,VOLF,CSOUND)
+	CALL EOSPALL(HG2,RHO,T,P2,QUAL,VOLF,CSOUND)
+	F2 = (P2-P1) / DELTAHG
+	F1 = P1 - F2 * HG1
+
+	RETURN
+	END
+
+//  **********************************************************
+//  EQUATION OF STATE FOR SPALLED MATERIAL (LIQUID AND/OR VAPOR)
+//  ALSO COMPUTE SOUND SPEED
+//  FOR LIQUID PART, USE SOLID (UNSPALLED) EOS
+//  FOR VAPOR PART, USE IDEAL GAS RELATION
+//  BASE TWO-PHASE FITTING ON Tsat vs. Psat CURVE
+//  NOTE THAT QUAL (OLD VALUE) IS SENT AS AN INITIAL GUESS
+//  UNITS: AL,AV COEFFICIENTS IN J/kg, PRESSURE IN Pa
+	SUBROUTINE EOSPALL(HG,RHO,T,P,QUAL,VOLF,CSOUND)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13),AH2T(10),EOSCOEF(10)
+	DIMENSION YIELDCOEF(3)
+
+	EXTERNAL QTWO
+	
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	COMMON/QTWODAT/HGTWO,RHOTWO,RHOV,RHOL,TTWO,HGL
+
+//  MINIMUM PRESSURE IN CHAMBER IS 10^-6 TORR
+	PMIN = 1.33D-04
+	GAMMA = EOSCOEF(9)
+	RBAR = EOSCOEF(10)
+	
+	TINF = AH2T(1)
+	AL0 = AH2T(7)
+	AL1 = AH2T(8)
+	AV0 = AH2T(9)
+	AV1 = AH2T(10)
+
+//  FIRST SEE IF LIQUID STATE WORKS OUT FOR LOW-QUALITY ZONE
+	TL = AL0 + HG * AL1
+	CALL EOSF(RHO,F1,F2)
+	PL = F1 + F2 * HG
+	PSAT = 10.**(ABOIL-BBOIL/TL)
+	IF (PL .GT. PSAT .AND. QUAL .LT. 0.05) THEN
+//  PURE LIQUID
+		P = PL
+		T = TL
+		CALL SOUND(HG,RHO,PL,F2,CSOUND)
+		QUAL = 0.0
+		VOLF = 0.0
+	ELSE
+
+//  SEE IF PURE VAPOR WORKS FOR HIGH-QUALITY ZONE
+		TV = AV0 + HG * AV1
+		PV = RHO * RBAR * TV
+		PSAT = 10.**(ABOIL-BBOIL/TL)
+		IF (PV .LT. PSAT .AND. QUAL .GT. 0.95) THEN
+//  PURE VAPOR WORKS
+			T = TV
+			P = PV
+			CSOUND = SQRT(RBAR*GAMMA*T)
+			QUAL = 1.0
+			VOLF = 1.0
+		ELSE
+
+//  TWO-PHASE REGION
+//  SEE IF TWO-PHASE BASED ON CURRENT QUALITY WILL WORK
+			HGTWO = HG
+			RHOTWO = RHO
+			QLOW = MAX(0.0,QUAL-0.05)
+			QHIGH = MIN(1.0,QUAL+0.05)
+			TESTLOW = QTWO(QLOW)
+			TESTHIGH = QTWO(QHIGH)
+			TESTPROD = TESTLOW * TESTHIGH
+			IF (TESTPROD .LT. 0.0) THEN
+
+//  EQUILIBRUM TWO-PHASE REGION
+//  ITERATE ON QUALITY USING BRENT'S ROUTINE
+				TOL = 1.0D-08
+				QUAL = ZBRENT(QTWO,QLOW,QHIGH,TOL)
+			ELSE
+
+//  TWO-PAHES BRACKETING FAILED, BASED ON LATEST QUALITY
+//  NON-EQUILIBRUM REGION
+				IF (ABS(TESTHIGH) .LT. ABS(TESTLOW)) THEN
+					QUAL = QHIGH
+				ELSE IF (ABS(TESTHIGH) .GT. ABS(TESTLOW)) THEN
+					QUAL = QLOW
+				ELSE 
+					QUAL = QUAL
+				END IF
+//  USE TTWO AND HGL FROM QTWO
+				TEST = QTWO(QUAL)
+				PSAT = 10.**(ABOIL-BBOIL/TTWO)
+//  GET RHOL FROM ITERATIONS OF NONLINEAR FUNCTIONS F1,F2
+				RHOL = RHO0
+				CALL NEWTP(HGL,PSAT,RHOL)
+//  DETERMINE NON-EQUILIBRUM VAPOR DENSITY
+				IF (QUAL .GT. 0.0) THEN
+					RHOV = RHOL / (1.0D+00-(1.0D+00-(RHOL/RHO))/QUAL)
+				ELSE
+					RHOV = PSAT / (RBAR * TTWO)
+				END IF
+			END IF
+
+//  COMPUTE THE REST OF THE TWO-PHASE PROPERTIES
+			T = TTWO
+//  ZONE PRESSURE WILL BE SATURATION PRESSURE
+			P = (10.**(ABOIL - BBOIL/T))
+			VOLF = QUAL * RHO / RHOV
+			IF (QUAL .GT. 0.999) THEN
+				VOLF = MIN(VOLF,1.0D+00)
+			END IF
+			IF (VOLF .GE. 0.0D+00 .AND. VOLF .LE. 1.0D+00) THEN
+//  NOW COMPUTE SOUND SPEDD
+				CALL EOSF(RHOL,F1,F2)
+				CALL SOUND(HGL,RHOL,P,F2,CLIQ)
+				CVAP = SQRT(RBAR*GAMMA*T)
+//  VOLUME FRACTION OF VAPOR FOR CRUDE INITIAL GUESS AT SOUND SPEED
+				CSOUND = VOLF*CVAP + (1.-VOLF)*CLIQ
+			ELSE
+//  THERE IS A PROBLEM WITH VOLF
+				WRITE(*,*) 'PROBLEM WITH VOLF IN EOSTWO'
+				WRITE(*,*) 'VOLF =',VOLF
+				WRITE(*,*) 'QUAL =',QUAL
+				WRITE(*,*) 'RHO =',RHO
+				WRITE(*,*) 'RHOV =',RHOV
+				STOP
+			END IF
+		END IF
+	END IF
+	
+	RETURN
+	END
+
+//  **********************************************************
+//  EQUATION OF STATE FOR 2-PHASE SPALLED MATERIAL (LIQUID AND VAPOR)
+//  ALSO COMPUTE SOUND SPEED
+//  FOR LIQUID PART, USE CURRENT LIQUID/SOLID EOS
+//  FOR VAPOR PART, USE IDEAL GAS RELATION
+//  BASE TWO-PHASE FITTING ON Tsat vs. Psat CURVE
+//  UNITS: AL,AV COEFFICIENTS IN J/kg, PRESSURE IN Pa
+	FUNCTION QTWO(QUAL)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13),AH2T(10),EOSCOEF(10),YIELDCOEF(3)
+
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	COMMON/QTWODAT/HG,RHO,RHOV,RHOL,T,HGL
+
+	AL0 = AH2T(7)
+	AL1 = AH2T(8)
+	AV0 = AH2T(9)
+	AV1 = AH2T(10)
+	GAMMA = EOSCOEF(9)
+	RBAR = EOSCOEF(10)
+	
+//  DETERMINE TEMPERATURE BASED ON ENERGY BALANCE
+	Z1 = HG + QUAL*AV0/AV1 + (1.0D+00-QUAL)*AL0/AL1
+	Z2 = (QUAL/AV1) + ((1.0D+00-QUAL)/AL1)
+	T = Z1 / Z2
+//  ENTHALPIES FOLLOW DIRECTLY
+	HGV = (T-AV0) / AV1
+	HGL = (T-AL0) / AL1
+//  ZONE PRESSURE WILL BE SATURATION PRESSURE
+	PSAT = (10.**(ABOIL - BBOIL/T))
+//  VAPOR DENSITY FROM IDEAL GAS RELATION
+	RHOV = PSAT / (RBAR * T)
+//  GET RHOL FROM ITERATIONS ON NONLINEAR FUNCTIONS F1,F2
+	RHOL = RHO0
+	CALL NEWTP(HGL,PSAT,RHOL)
+
+//  GET QUALITY IMPLIED BY MASS BALANCE
+	QUALRHO = (1.0D+00-RHOL/RHO) / (1.0D+00-RHOL/RHOV)
+
+//  QUALITIES MUST BE EQUAL IN CONVERGED SOLUTION
+	QTWO = QUAL - QUALRHO
+
+	RETURN
+	END
+
+//  **********************************************************
+//  NEWTON'S METHOD ITERATION TO FIND DENSITY,
+//  GIVEN PRESSURE AND SPECIFIC ENERGY
+//  F1 = F1(RHO) AND F2 = F2(RHO)
+//  FOR LINEAR EOS: PRESSURE = F1 + F2 * ENERGY
+	SUBROUTINE NEWTP(HG,P,RHO)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+
+	TOL = 1.0D-06
+	K = 0
+	RHONEW = RHO
+
+10	CONTINUE
+
+	RHO = RHONEW
+	CALL EOSF(RHO,F1,F2)
+	CALL EOSDF(RHO,DF1,DF2)
+	F = F1 + F2*HG - P
+	FP = DF1 + HG*DF2
+	RHONEW = RHO - F/FP
+	
+	K = K+1
+	IF (K .GT. 10) THEN
+		WRITE(*,*) 'TOO MANY ITERATIONS ON RHOL'
+		STOP
+	END IF
+
+	IF (ABS(RHONEW-RHO) .GT. TOL) GOTO 10
+	RHO = RHONEW
+
+	RETURN
+	END
+
+//  **********************************************************
+//  CALCULATION OF SURFACE EVAPORATION MASS AND ENERGY LOSS
+//  FOR CRUDE ESTIMATE USING MAXIMUM FLUX (PAMB=0)
+//  LIMIT FROM KELLEY & ROTHENBERG, NUC INST & METH, 1985, p 755
+	SUBROUTINE SURFVAP(GEOM,PAMB,TSAT,X,DT,DVAPMASS,DHVAP)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	INTEGER GEOM
+	DIMENSION ACOND(13),AH2T(10),EOSCOEF(10)
+	DIMENSION YIELDCOEF(3)
+
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+
+	PI = 4.0 * ATAN(1.0)
+	RBAR = EOSCOEF(10)
+
+//  VAPOR PRESSURE FUNCTION FROM DUSHMAN, PRESSURE IN Pa
+	PSAT = (10.**(ABOIL - BBOIL/TSAT))
+//  FLUX IN kg/m2.sec
+	FLUX = PSAT / SQRT(2. * PI * RBAR * TSAT)
+
+	IF (GEOM .EQ. 1) THEN
+		AREA = 1.0D+00
+	ELSE IF (GEOM .EQ. 2) THEN
+		AREA = 2.0 * PI * X
+	ELSE
+		AREA = 4.0 * PI * X**2
+	END IF
+	DVAPMASS = FLUX * DT * AREA
+
+//  ENERGY IN THIS MASS
+//  ASSUME VAPOR AT CURRENT ZONE TEMPERATURE
+//  USES LINEAR FIT TO T VS. H CURVE (in K vs. J/kg)
+	HG = (TSAT - AH2T(9)) / AH2T(10)
+	HL = (TSAT - AH2T(7)) / AH2T(8)
+	DHVAP = (HG - HL) * DVAPMASS
+
+	RETURN
+	END
+
+//  **********************************************************
+//  COMPUTE EQUATION OF STATE COEFFICIENTS FOR SURFACE ZONE
+//  F1 = F1(RHO) AND F2 = F2(RHO)
+//  FOR LINEAR EOS: PRESSURE = F1 + F2 * ENERGY
+//  ASSUMES IDEAL GAS EOS: P = (GAMMA-1)*RHO*HG
+//  OR JUST USE SOLID EOS FOR LOW VAPOR FRACTION
+	SUBROUTINE FSURF(RHO,RHOL,QUAL,QMIN,F1,F2)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	
+	IF (QUAL .LE. QMIN) THEN
+//  JUST LIQUID/SOLID IN ZONE, SO IGNORE VAPOR
+		CALL EOSF(RHO,F1,F2)
+	ELSE
+//  APPROXIMATION BASED ON CONSTANT RHOL FROM LAST TIME STEP
+		RHOV = QUAL / ((1./RHO) + (QUAL - 1.0D+00)/RHOL)
+		CALL FVAPOR(RHOV,F1,F2)
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  ROUTINE TO DETERMINE NEW VELOCITY OF OUTER NODE
+//  BASED ON PSEUDO-STEADY ISENTROPIC IDEAL GAS FLOW REALTIONS
+//  ASSUME VAPORIZING SURFACE IS STATIONARY
+//  VAPORIZING SURFACE AT P0=Psat, OUTER SURFACE AT P=P(0)
+	SUBROUTINE USURFIX(T,P0,P,UNEW)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION EOSCOEF(10),YIELDCOEF(3)
+
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+
+	GAMMA = EOSCOEF(9)
+	RBAR = EOSCOEF(10)
+	GM1 = GAMMA - 1.0D+00
+
+	C0 = SQRT(RBAR*GAMMA*T)
+
+	UNEW = C0*SQRT((2./GM1)*DABS((1.0D+00-(P/P0)**(GM1/GAMMA))))
+
+//  KEEP WITH SIGN CONVENTION
+	IF (P .LT. P0) THEN
+		UNEW = -UNEW
+	END IF
+	
+	RETURN
+	END
+
+//  **********************************************************
+//  ROUTINE TO DETERMINE NEW PRESSURE AT OUTER NODE OF ISURF
+//  BASED ON PSEUDO-STEADY ISENTROPIC IDEAL GAS FLOW REALTIONS
+//  C/C0 = 1 - B*X LINEAR ACCROS EXPANSION FAN
+//  BUT ASYMPTOTE TO IDEAL GASS PRESSURE IN SPALLED ZONE
+	SUBROUTINE PLEFTCALC(PSAT,PC,DXC1,DX1,RHOV,QUAL,T,PLEFT)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION EOSCOEF(10),YIELDCOEF(3)
+
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+
+	GAMMA = EOSCOEF(9)
+	RBAR = EOSCOEF(10)
+	GM1 = GAMMA - 1.0D+00
+	N = 4
+
+//  ASSUME AVERAGE DROP ACROSS SONIC KNUDSEN LAYER (KNIGHT)
+//  P0 = 0.235 * PSAT
+//  ASSUME NO DROP ACROSS KNUDSEN LAYER
+	P0 = PSAT
+	B = (1.0D+00-(PC/P0)**(GM1/(2.*GAMMA)))/DXC1
+	PEXP = P0 * (1.0D+00 - B*DX1)**(2.*GAMMA/GM1)
+	PEXP = MAX(PEXP,PC)
+
+//  AVERAGE VAPOR PRESSURE
+	PVAP = RHOV * RBAR * T
+
+//  INTERPOLATE BETWEEN THESE PRESSURES WITH Nth ORDER FUNCTION
+	QSTAR = (1.0D+00 - QUAL)**N
+	PLEFT = PEXP * QSTAR + (1.0D+00 - QSTAR) * PVAP
+
+	RETURN
+	END
+
+//  **********************************************************
+//  EQUATION OF STATE FOR (IN GENERAL) 2-PHASE SURFACE ZONE
+//  FOR LIQUID PART, USE CURRENT LIQUID/SOLID EOS
+//  FOR VAPOR PART, USE IDEAL GAS RELATION
+//  UNITS: AL,AV COEFFICIENTS IN J/kg, PRESSURE IN Pa
+//  NOTE THAT T PROVIDES BOTH AN INITIAL TEMPERATURE GUESS
+//   AND RETURNS THE FINAL TEMPERATURE RESULT
+	SUBROUTINE EOSURF(RHOL,RHOV,RHOP1,QMIN,PM1,P,ALPHA,CSOUND)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13),AH2T(10),EOSCOEF(10)
+	DIMENSION YIELDCOEF(3)
+
+	EXTERNAL TSURF, PSURF
+	
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	COMMON/SURFT/HGSURF,QUALSURFT
+	COMMON/SURFP/RHOSURF,QUALSURFP,HGV,HGL,T
+
+	AL0 = AH2T(7)
+	AL1 = AH2T(8)
+	AV0 = AH2T(9)
+	AV1 = AH2T(10)
+	GAMMA = EOSCOEF(9)
+	RBAR = EOSCOEF(10)
+	QUAL = QUALSURFT
+	HG = HGSURF
+	RHO = RHOSURF
+
+//  ITERATE ON TEMPERATURE CHOICE TO MATCH VALUES OBTAINED FOR LIQUID AND VAPOR
+//  SOLVE ISING BRENT'S METHOD (SEE NUMERICAL RECIPES)
+//  HG1 AND HG2 MUST BRACKET THE ROOT TO Tvapor-Tliquid=0,
+//  WHICH IS IN THE EXTERNAL FUNCTION TSURF(HGV)
+//  WHERE HGV IS THE SPECIFIC ENERGY OF THE VAPOR PHASE
+//  FIRST GET TWO HGV VALUES THAT BRACKET FUNCTION ZERO
+	HGNOM = (T - AV0) / AV1
+	CALL BRACKET(TSURF,HGNOM,HG1,HG2)
+	TOL = 1.0D-05
+	HGV = ZBRENT(TSURF,HG1,HG2,TOL)
+	HGL = (HG - QUAL*HGV) / (1.0D+00 - QUAL)
+
+	TV = AV0 + AV1 * HGV
+	CALL H2T(HGL,TL)
+
+	TRATIO = 2.*ABS(TV-TL)/(TV+TL)
+	IF (TRATIO .GT. 0.01) THEN
+		WRITE(*,*) 'PROBLEM IN ISURF TEMP MATCH'
+		WRITE(*,*) 'TL, TV =', TL,TV
+		STOP
+	ELSE
+		T = (TL + TV) / 2.00D+00
+	END IF
+
+//  NOW DETERMINE PRESSURE IN THE SURFACE ZONE
+//  FOR SMALL VAPOR CONTENT, ASSUME FULLY LIQUID/SOLID AS IN FSURF
+//  OTHERWISE, FIX PRESSURE AT Psat
+	IF (QUAL .LE. QMIN) THEN
+		RHOL = RHO
+		CALL EOSF(RHO,F1,F2)
+		P = F1 + F2 * HG
+		CALL SOUND(HG,RHO,P,F2,CSOUND)
+		ALPHA = 0.0D+00
+		RHOV = P / (RBAR * T)
+	ELSE
+
+//  SET PRESSURE EQUAL TO THE SATURATION VAPOR PRESSURE
+//  OR THE PRESSURE IN THE NEXT VAPOR ZONE, WHICHEVER IS HIGHER
+		PSAT = (10.**(ABOIL - BBOIL/T))
+		P = MAX(PSAT,PM1)
+
+//  UPDATE LIQUID DENSITY BASED ON THIS PRESSURE
+//  MUST ITERATE WITH BRENT'S METHOD
+//  FIRST GET TWO RHOL VALUES THAT BRACKET FUNCTION ZERO
+		RNOM = RHOL
+		CALL BRACKET(PSURF,RNOM,RL1,RL2)
+		TOL = 1.0D-05
+		RHOL = ZBRENT(PSURF,RL1,RL2,TOL)
+//  UNDER SOME CONDITIONS
+//   RHOL MAY CALCULATE TO BE LESS THAN RHO
+//   SET A FLOOR DENSITY ON WHICH TO BASE A RHOV CALCULATION
+//   ADJUST ZONE PRESSURE ACCORDINGLY
+		IF (RHOL .LT. RHO) THEN
+			IF (RHOP1 .GT. RHO) THEN
+				RHOL = RHOP1
+			ELSE
+				RHOL = RHO + 1.0
+			END IF
+			CALL EOSF(RHOL,F1,F2)
+			P = F1 + F2 * HGL
+		END IF
+
+//  COMPUTE VOLUME FRACTION VAPOR
+		RHOV = QUAL / ((1./RHO) + (QUAL - 1.0D+00)/RHOL)
+		ALPHA = QUAL * RHO / RHOV
+//  NOW COMPUTE SOUND SPEED
+		CALL EOSF(RHOL,F1,F2)
+		CALL SOUND(HGL,RHOL,P,F2,CLIQ)
+		CVAP = SQRT(RBAR*GAMMA*T)
+//  VOLUME FRACTION OF VAPOR FOR CRUDE GUES AT SOUND SPEED
+		CSOUND = ALPHA*CVAP + (1.-ALPHA)*CLIQ
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  TEMPERATURE ITERATION FOR 2-PHASE SURFACE ZONE
+//  NOTE THAT T PROVIDES BOTH AN INITIAL TEMPERATURE GUESS
+//   AND RETURNS THE FINAL TEMPERATURE RESULT
+	SUBROUTINE EOSURFT(QMIN,T)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13),AH2T(10),EOSCOEF(10)
+	DIMENSION YIELDCOEF(3)
+
+	EXTERNAL TSURF
+	
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	COMMON/SURFT/HG,QUAL
+
+	AL0 = AH2T(7)
+	AL1 = AH2T(8)
+	AV0 = AH2T(9)
+	AV1 = AH2T(10)
+	GAMMA = EOSCOEF(9)
+	RBAR = EOSCOEF(10)
+
+	IF (QUAL .LT. QMIN) THEN
+//  ALL LIQUID OR SOLID
+		CALL H2T(HG,T)
+	ELSE IF (QUAL .GT. 0.99999) THEN
+//  ESSENTIALLY ALL VAPOR
+		T = AV0 + AV1 * HG
+	ELSE
+//  ITERATE ON TEMPERATURE CHOICE TO MATCH VALUES OBTAINED FOR LIQUID AND VAPOR
+//  SOLVE ISING BRENT'S METHOD (SEE NUMERICAL RECIPES)
+//  HG1 AND HG2 MUST BRACKET THE ROOT TO Tvapor-Tliquid=0,
+//  WHICH IS IN THE EXTERNAL FUNCTION TSURF(HGV)
+//  WHERE HGV IS THE SPECIFIC ENERGY OF THE VAPOR PHASE
+//  FIRST GET TWO HGV VALUES THAT BRACKET FUNCTION ZERO
+		HGNOM = (T - AV0) / AV1
+		CALL BRACKET(TSURF,HGNOM,HG1,HG2)
+		TOL = 1.0D-05
+		HGV = ZBRENT(TSURF,HG1,HG2,TOL)
+		HGL = (HG - QUAL*HGV) / (1.0D+00 - QUAL)
+		TV = AV0 + AV1 * HGV
+		CALL H2T(HGL,TL)
+		TRATIO = 2.*ABS(TV-TL)/(TV+TL)
+		IF (TRATIO .GT. 0.01) THEN
+			WRITE(*,*) 'PROBLEM IN ISURF TEMP MATCH'
+			WRITE(*,*) 'TL, TV =', TL,TV
+			STOP
+		ELSE
+			T = (TL + TV) / 2.00D+00
+		END IF
+	END IF
+
+	RETURN
+	END
+
+//  **********************************************************
+//  TEMP MATCHING FUNCTION FOR (IN GENERAL) 2-PHASE SURFACE ZONE
+//  FORM IS TSURF = Tvap - Tliq -> 0 WITH BRENT'S METHOD
+//  TSURF IS A FUNCTION OF VAPOR ENERGY (HGV)
+//  ROOT SOLVER WILL VARY ENERGY PARTITION VAPOR/LIQUID TO MATCH TEMPS
+	FUNCTION TSURF(HGV)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION ACOND(13),AH2T(10)
+
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/SURFT/HG,QUAL
+
+	AV0 = AH2T(9)
+	AV1 = AH2T(10)
+
+	HGL = (HG - QUAL*HGV) / (1.0D+00 - QUAL)
+	TV = AV0 + AV1 * HGV
+	CALL H2T(HGL,TL)
+	TSURF = TV - TL
+
+	RETURN
+	END
+
+//  **********************************************************
+//  PRESSURE MATCHING FUNCTION FOR 2-PHASE SURFACE ZONE
+//  FORM IS PSURF = Psat - Tliq -> 0 WITH BRENT'S METHOD
+//  PSURF IS A FUNCTION OF LIQUID DENSITY (RHOL)
+//  ROOT SOLVER WILL VARY LIQUID DENSITY TO MATCH PRESSURES
+	FUNCTION PSURF(RHOL)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DIMENSION EOSCOEF(10),YIELDCOEF(3)
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	COMMON/SURFP/RHO,QUAL,HGV,HGL,T
+
+	PSAT = (10.**(ABOIL - BBOIL/T))
+
+	CALL EOSF(RHOL,F1L,F2L)
+	PL = F1L + F2L * HGL
+
+	PSURF = PSAT - PL
+
+	RETURN
+	END
+
+//  **********************************************************
+//  BRENT'S METHOD TO FIND THE ROOT OF A FUNCTION FUNC KNOWN TO
+//  LIE BETWEEN X1 AND X2. THE RROT, ZBRENT, WILL BE REFINED UNTIL
+//  ITS ACCURACY IS TOL
+//  PARAMETERS: MAX # OF ITERATIONS, MACHINE FLOATING-POINT PRECISION
+//  REFERENCE: NUMERICAL RECIPES, SECTION 9.3
+//  IS RECURSIVE
+	FUNCTION ZBRENT(FUNC,X1,X2,TOL)
+	INTEGER ITMAX
+	DOUBLE PRECISION ZBRENT,TOL,X1,X2,FUNC,EPS
+	EXTERNAL FUNC
+	PARAMETER (ITMAX=100, EPS=1.0D-15)
+	INTEGER ITER
+	DOUBLE PRECISION A,B,C,D,E,FA,FB,FC,P,Q,R,S,TOL1,XM
+
+	A = X1
+	B = X2
+	FA = FUNC(A)
+	FB = FUNC(B)
+	IF ((FA .GT. 0. .AND. FB .GT. 0.) .OR.
+     &		(FA .LT. 0. .AND. FB .LT. 0.)) THEN
+		WRITE(*,*) 'ROOT MUST BE BRACKETED FOR ZBRENT'
+		WRITE(*,*) 'X1,X2 =',X1,X2
+		WRITE(*,*) 'F(X1),F(X2) =',FA,FB
+		STOP
+	END IF
+	C = B
+	FC = FB
+	DO 11, ITER=1,ITMAX
+		IF ((FB .GT. 0. .AND. FC .GT. 0.) .OR. 
+     &			(FB .LT. 0. .AND. FC .LT. 0.)) THEN
+			C = A
+			FC = FA
+			D = B - A
+			E = D
+		END IF
+		IF (ABS(FC) .LT. ABS(FB)) THEN
+			A = B
+			B = C
+			C = A
+			FA = FB
+			FB = FC
+			FC = FA
+		END IF
+//  CONVERGENCE CHECK
+		TOL1 = 2. * EPS * ABS(B) + 0.5 * TOL
+		XM = 0.5 * (C - B)
+		IF (ABS(XM) .LE. TOL1 .OR. FB .EQ. 0.) THEN
+			ZBRENT = B
+			RETURN
+		END IF
+		IF (ABS(E) .GE. TOL1 .AND. ABS(FA) .GT. ABS(FB)) THEN
+//  ATTEMPT INVERSE QUADRATIC INTERPOLATION
+			S = FB / FA
+			IF (A .EQ. C) THEN
+				P = 2. * XM * S
+				Q = 1.0D+00 - S
+			ELSE
+				Q = FA / FC
+				R = FB / FC
+				P = S * (2.*XM*Q*(Q-R) - (B-A)*(R-1.0D+00))
+				Q = (Q-1.0D+00) * (R-1.0D+00) * (S-1.0D+00)
+			END IF
+			IF (P .GT. 0.) Q = -Q
+//  CHECK WHETHER IN BOUNDS
+			P = ABS(P)
+			IF (2.*P .LT. MIN(3.*XM*Q-ABS(TOL1*Q),ABS(E*Q))) THEN
+//  ACCEPT INTERPOLATION
+				E = D
+				D = P / Q
+			ELSE
+//  INTERPOLATION FAILED, USE BISECTION
+				D = XM
+				E = D
+			END IF
+		ELSE
+//  BOUNDS DECREASING TOO SLOWLY, USE BISECTION
+			D = XM
+			E = D
+		END IF
+//  MOVE LAST BEST GUESS TO A
+		A = B
+		FA = FB
+//  EVALUEATE NEW TRIAL ROOT
+		IF (ABS(D) .GT. TOL1) THEN
+			B = B + D
+		ELSE
+			B = B + DSIGN(TOL1,XM)
+		END IF
+		FB = FUNC(B)
+11	CONTINUE
+	
+	WRITE(*,*) 'ZBRENT EXCEEDED MAXIMUM ITERATIONS'
+	ZBRENT = B
+
+	RETURN
+	END
+
+//  **********************************************************
+//  ROUTINE TO BRACKET ROOT OF FUNCTIONS, TO GIVE INPUT TO
+//  BRENT'S METHOD TO FIND THE ROOT OF A FUNCTION FUNC
+//  SINGLE-SIDED SEARCH, WITH XMIN AS LOWER LIMIT ALLOWED
+	SUBROUTINE BRKTMIN(FUNC,XMIN,XNOM,X1,X2)
+	DOUBLE PRECISION XMIN,XNOM,X1,X2,FUNC
+	EXTERNAL FUNC
+	DOUBLE PRECISION A,B,FA,FB
+
+	A = MAX(XMIN,XNOM*.85)
+	B = A * 1.02
+	FA = FUNC(A)
+
+	DO 10, ICNT=1,20
+		FB = FUNC(B)
+		IF ((FA .GT. 0. .AND. FB .LT. 0.) .OR. 
+     &			(FA .LT. 0. .AND. FB .GT. 0.)) THEN
+			X1 = A
+			X2 = B
+			RETURN
+		END IF
+		B = B * 1.02
+10	CONTINUE
+	WRITE (*,*) 'TOO MANY BRACKET ITERATIONS WITH XMIN'
+	B = A * 1.02
+	FB = FUNC(B)
+	WRITE (*,*) 'A,B=',A,B
+	WRITE (*,*) 'FA,FB=',FA,FB
+	STOP
+	END
+
+//  **********************************************************
+//  ROUTINE TO BRACKET ROOT OF FUNCTIONS, TO GIVE INPUT TO
+//  BRENT'S METHOD TO FIND THE ROOT OF A FUNCTION FUNC
+//  BASED ON USING A NOMINAL X AS STARTING POINT
+//  IS RECURSIVE
+	SUBROUTINE BRACKET(FUNC,XNOM,X1,X2)
+	DOUBLE PRECISION XNOM,X1,X2,FUNC
+	DOUBLE PRECISION A,B,C,FA,FB,FC
+	EXTERNAL FUNC
+	
+	IFLAG = 0
+
+	IF (XNOM .EQ. 0.0) THEN
+		A = -1.0
+		B = 1.0
+	ELSE
+		A = XNOM * 0.9999
+		B = XNOM * 1.02
+	END IF
+	FA = FUNC(A)
+	FB = FUNC(B)
+	
+20	CONTINUE
+	
+	IF ((FA .GT. 0. .AND. FB .LT. 0.) .OR. 
+     &		(FA .LT. 0. .AND. FB .GT. 0.)) THEN
+		X1 = B
+		X2 = A
+		RETURN
+	END IF
+//  PICK A NEW POINT WITH LINEAR INTERPOLATION + 2%
+	DO 10, ICNT=1,20
+		C = B - 1.02 * (A-B) * FB / (FA-FB)
+		FC = FUNC(C)
+		IF ((FA .GT. 0. .AND. FC .LT. 0.) .OR. 
+     &			(FA .LT. 0. .AND. FC .GT. 0.)) THEN
+			IF (ABS(A-C) .LT. ABS(B-C)) THEN
+				X1 = C
+				X2 = A
+				RETURN
+			ELSE
+				X1 = C
+				X2 = B
+				RETURN
+			END IF
+		END IF
+//  THROW AWAY POINT FARTHEST FROM NEW POINT, AND TRY AGAIN
+		IF (ABS(A-C) .LT. ABS(B-C)) THEN
+			B = C
+			FB = FC
+		ELSE
+			A = C
+			FA = FC
+		END IF
+
+		IF (IFLAG .EQ. 1) THEN
+			WRITE(*,*) A,FA
+			WRITE(*,*) B,FB
+		END IF
+
+10	CONTINUE
+
+//  TOO MANY BRACKET ITERATIONS
+	A = XNOM * 10.000
+	B = XNOM * (-10.00)
+	FA = FUNC(A)
+	FB = FUNC(B)
+	IFLAG = IFLAG+1
+	IF (IFLAG .EQ. 1) THEN
+		GOTO 20
+	ELSE
+		WRITE(*,*) 'TOO MANY BRACKET ITERATIONS'
+		WRITE(*,*) 'A,B=',A,B
+		WRITE(*,*) 'FA,FB=',FA,FB
+		STOP
+	END IF
+	
+	RETURN
+	END
+
+//  **********************************************************
+//  FUNCTION FOR IMPLICIT HEAT CONDUCTION BETWEEN ZONES
+//  ISURF AND (ISURF+1), TO BE SOLVED WITH BRENT'S METHOD
+//  RETURNS DIFFERENCE BETWEEN HEAT CONDUCTION (INPUT)
+//  AND FOURIER CONDUCTION BASED ON TEMPS AT END OF TIME STEP
+//  HPN & HEN ARE ENERGIES AT STEP N, REST OF H & T AT N+1
+	FUNCTION CONDSURF(HEAST)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	COMMON/SURFC/HPN,HEN,ZMP,ZME,DT,QMIN,CONDP,DX,BETAC,TP
+	COMMON/SURFT/HGP,QUAL
+
+//  COMPUTE NEW ZONE ENERGIES BASED ON CURRENT HEAST
+	HP = HPN - HEAST * DT
+	HE = HEN + HEAST * DT
+	HGP = HP / ZMP
+	HGE = HE / ZME
+//  UPDATE TEMPERATURES
+	CALL EOSURFT(QMIN,TP)
+	CALL H2T(HGE,TE)
+//  COMPUTE FOURIER CONDUCTION BASED ON NEW TEMPS
+	HEASTNEW = (TP - TE) * CONDP * BETAC / DX
+
+	CONDSURF = HEASTNEW - HEAST
+	RETURN
+	END
+
+//  **********************************************************
+//  BUBBLE NUCLEATION RATE ROUTINE
+//  FROM CAREY, EQN 5.74
+//  MATERIAL PROPERTIES HARDWIRED FOR AL,ALUMINA,SILICA
+//  UNITS: J in m-3.s-1, SIGMA in N/m
+	SUBROUTINE NUCLEATE(T,RHO,P,J,TSTAR)
+	IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+	DOUBLE PRECISION J,ISTAR
+	DIMENSION ACOND(13),AH2T(10),EOSCOEF(10),SIGMACOEF(7)
+	DIMENSION YIELDCOEF(3)
+
+	COMMON/MATDAT/TMELT,HMELTI,HMELTT,ACOND,AH2T
+	COMMON/EOSDAT/RHO0,EOSCOEF,ABOIL,BBOIL,PRNU,YIELDCOEF
+	COMMON/SURFTEN/SIGMACOEF
+
+	RBAR = EOSCOEF(10)
+	JFLAG = NINT(SIGMACOEF(1))
+
+	IF (JFLAG .EQ. 0) THEN
+//  NO MATERIAL SURFACE TENSION INFORMATION -> SKIP J CALCULATION
+		J = 2.0D-97
+		TSTAR = 0.1
+	ELSE 
+		IF (JFLAG .EQ. 1) THEN
+//  FIT PARAMETERS FOR FIT TO MURR (CUBIC EQUATION)
+			A = SIGMACOEF(2)
+			TCRIT = SIGMACOEF(3)
+			SIGMA0 = SIGMACOEF(4)
+			ASIG = SIGMACOEF(5)
+			BSIG = SIGMACOEF(6)
+			CSIG = SIGMACOEF(7)
+		ELSE IF (JFLAG .EQ. 2) THEN
+//  FIT PARAMETERS FOR EXPONENTIAL EQUATION
+			A = SIGMACOEF(2)
+			TCRIT = SIGMACOEF(3)
+			AEXP = SIGMACOEF(4)
+			BEXP = SIGMACOEF(5)
+		ELSE
+			WRITE(*,*) 'INVALID MATERIAL (NUCLEATE)'
+			STOP
+		END IF
+
+		AVOGADRO = 6.022D+26
+		GAMMAE = 0.5772
+		BOLTZ = 1.38D-23
+		PI = 4.*ATAN(1.)
+
+		IF (T .LT. TMELT) THEN
+			WRITE(*,*) 'T OUTSIDE RANGE FOR NUCLEATE'
+			J = 1.0D-98
+			TSTAR = 0.1
+		ELSE IF (T .GE. TCRIT) THEN
+			IF (P .GT. 0.) THEN
+				J = 1.0D-96
+				TSTAR = 0.1
+			ELSE
+				J = 1.0D+43
+				TSTAR = 1.0D-19
+			END IF
+		ELSE
+//  COMPUTE SATURATION PRESSURE
+			PSAT = (10.**(ABOIL - BBOIL/T))
+
+			IF (P .GT. PSAT) THEN
+				J = 1.0D-96
+				TSTAR = 0.1
+			ELSE
+//  COMPUTE SURFACE TENSION
+				IF (JFLAG .EQ. 2) THEN
+//  USE EXPONENTIAL FIT EQUATION
+					SIGMA = AEXP * 10.**(BEXP * T)
+				ELSE
+//  CUBIC SPLINE FIT TO DATA AT MELT TEMP AND ZERO AT CRIT
+					T1 = (T - TMELT)
+					SIGMA = SIGMA0 + T1*(ASIG+T1*(BSIG+T1*CSIG))
+				END IF
+		
+				ETA = DEXP((P-PSAT)/(RHO*RBAR*T))
+				X1 = -1.8195D+24 * (SIGMA**3)/(T*(ETA*PSAT-P)**2)
+				X2 = SQRT(RHO**2 * SIGMA / A)
+
+				J = 1.44D+40 * X2 * DEXP(X1)
+				J = MAX(J,1.0D-97)
+			END IF
+
+//  COMPUTE INDUCTION TIME REQUIRED TO REACH STEADY J-VALUE
+//  FROM MODIFICATION OF VAPOR CONDENSATION MEO BY WILEMSKI
+//  RSTAR IS THE CRITICAL BUBBLE RADIUS (meters)
+			RSTAR = 2. * SIGMA / (ETA*PSAT - P)
+			IF (RSTAR .LE. 0.) THEN
+				TSTAR = 1.0D-02
+			ELSE
+				U = SQRT(8.*RBAR*T/PI)
+				RHOV = PSAT / (RBAR * T)
+				SMALLM = A / AVOGADRO
+				SMALLN = ETA * PSAT / (BOLTZ * T)
+				ISTAR = (4./3.) * PI * RSTAR**3 * RHOV / SMALLM
+				WSTAR = (16.*PI/2.)*SIGMA**3/(BOLTZ*T*(ETA*PSAT-P)**2)
+				TSTAR = RSTAR*ISTAR*RHOV / (U*SMALLM*SMALLN*WSTAR) * 
+     &					(DLOG(WSTAR/3.) + GAMMAE)
+				IF (TSTAR .LE. 0.) TSTAR = 1.0D-18
+			END IF
+		END IF
+	END IF
+	
+101	FORMAT(7(1PE12.3))
+
+	RETURN
+	ENDR = 2. * SIGMA / (ETA*PSAT - P)
+			IF (RSTAR .LE. 0.) THEN
+				TSTAR = 1.0D-02
+			ELSE
+				U = SQRT(8.*RBAR*T/PI)
+				RHOV = PSAT / (RBAR * T)
+				SMALLM = A / AVOGADRO
+				SMALLN = ETA * PSAT / (BOLTZ * T)
+				ISTAR = (4./3.) * PI * RSTAR**3 * RHOV / SMALLM
+				WSTAR = (16.*PI/2.)*SIGMA**3/(BOLTZ*T*(ETA*PSAT-P)**2)
+				TSTAR = RSTAR*ISTAR*RHOV / (U*SMALLM*SMALLN*WSTAR) * 
+     &					(DLOG(WSTAR/3.) + GAMMAE)
+				IF (TSTAR .LE. 0.) TSTAR = 1.0D-18
+			END IF
+		END 

@@ -1,0 +1,15 @@
+Conversion table for fortran FORMAT to C printf formatting
+sources:
+http://www.cs.mtu.edu/~shene/COURSES/cs201/NOTES/chap05/format.html
+http://www.cplusplus.com/reference/cstdio/printf/
+
+[] = optional
+In fortran, number preceding a format means repeat count
+formated preceded by kP means scale by 10^k
+
+Fortran	C
+---------------
+F[a.b]	%F[a.b]
+A1		%c
+I[n]	%i[n]
+E[a.b]	%E[a.b]
